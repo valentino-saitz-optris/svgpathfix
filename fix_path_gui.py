@@ -463,8 +463,6 @@ class SVGPathFixerGUI:
 
         self.current_file = None
         self.analysis = None
-        self.processed_tree = None
-
         # Current parameter values (set by sliders)
         self.threshold = 0.5
         self.simplify = 0.5
@@ -568,8 +566,8 @@ class SVGPathFixerGUI:
 
         if DND_AVAILABLE:
             self.file_label.configure(text="Drop SVG here or click Browse\u2026")
-            inp.drop_target_register(DND_FILES)
-            inp.dnd_bind('<<Drop>>', self.on_drop)
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self.on_drop)
 
         # -- Charts / Analysis frame --
         if MPL_AVAILABLE:
@@ -684,12 +682,8 @@ class SVGPathFixerGUI:
 
         # Buttons
         self.save_btn = ttk.Button(bottom_frame, text="Save As\u2026", command=self.on_save)
-        self.save_btn.pack(side='right', padx=(6, 0))
+        self.save_btn.pack(side='right')
         self.save_btn.state(['disabled'])
-
-        self.process_btn = ttk.Button(bottom_frame, text="Process", command=self.on_process)
-        self.process_btn.pack(side='right')
-        self.process_btn.state(['disabled'])
 
     def _setup_text_analysis_frame(self, pad):
         """Fallback: plain text analysis when matplotlib is not available."""
@@ -709,12 +703,8 @@ class SVGPathFixerGUI:
                          variable=self.enable_simplify_var).pack(side='left')
 
         self.save_btn = ttk.Button(btn_frame, text="Save As\u2026", command=self.on_save)
-        self.save_btn.pack(side='right', padx=(6, 0))
+        self.save_btn.pack(side='right')
         self.save_btn.state(['disabled'])
-
-        self.process_btn = ttk.Button(btn_frame, text="Process", command=self.on_process)
-        self.process_btn.pack(side='right')
-        self.process_btn.state(['disabled'])
 
     # ── Histogram drawing ────────────────────────────────────────
 
@@ -874,10 +864,6 @@ class SVGPathFixerGUI:
         all_pts = [pts for pts in all_pts if len(pts) >= 2]
         self._preview_pts = all_pts
         self._preview_bounds = _compute_bounds(all_pts) if all_pts else None
-        # Reset view on new data
-        self._view_zoom = 1.0
-        self._view_pan_x = 0.0
-        self._view_pan_y = 0.0
         self._redraw_preview()
 
     def _redraw_preview(self):
@@ -906,6 +892,11 @@ class SVGPathFixerGUI:
         ox = cx + (base_ox - cx) * self._view_zoom + self._view_pan_x
         oy = cy + (base_oy - cy) * self._view_zoom + self._view_pan_y
 
+        # Determine if zoom is high enough to show point markers
+        # At base zoom, avg segment ≈ a few pixels; show dots when segments are ≥ 8px apart
+        show_dots = self._view_zoom >= 5.0
+        dot_r = min(max(scale * 0.3, 1.5), 6)  # radius scales with zoom, clamped
+
         for i, pts in enumerate(self._preview_pts):
             color = PREVIEW_COLORS[i % len(PREVIEW_COLORS)]
             coords = []
@@ -914,6 +905,38 @@ class SVGPathFixerGUI:
                 coords.append(y * scale + oy)
             if len(coords) >= 4:
                 c.create_line(*coords, fill=color, width=1)
+
+            if show_dots and len(pts) >= 2:
+                # Draw circles at each intermediate point
+                for j in range(1, len(pts) - 1):
+                    sx = pts[j][0] * scale + ox
+                    sy = pts[j][1] * scale + oy
+                    c.create_oval(sx - dot_r, sy - dot_r, sx + dot_r, sy + dot_r,
+                                  fill=color, outline='')
+
+                # Check if subpath is closed (first point ≈ last point)
+                fx, fy = pts[0]
+                lx, ly = pts[-1]
+                closed = (abs(fx - lx) + abs(fy - ly)) * scale < 2.0
+
+                if closed:
+                    # Closed: just a dot at the start
+                    sx = fx * scale + ox
+                    sy = fy * scale + oy
+                    c.create_oval(sx - dot_r, sy - dot_r, sx + dot_r, sy + dot_r,
+                                  fill=color, outline='')
+                else:
+                    # Start marker: green square
+                    sr = dot_r * 1.4
+                    sx = fx * scale + ox
+                    sy = fy * scale + oy
+                    c.create_rectangle(sx - sr, sy - sr, sx + sr, sy + sr,
+                                       fill='#2ca02c', outline='white', width=1)
+                    # End marker: red diamond
+                    ex = lx * scale + ox
+                    ey = ly * scale + oy
+                    c.create_polygon(ex, ey - sr, ex + sr, ey, ex, ey + sr, ex - sr, ey,
+                                     fill='#d62728', outline='white', width=1)
 
         # Summary text
         zoom_pct = self._view_zoom * 100
@@ -1015,7 +1038,6 @@ class SVGPathFixerGUI:
 
     def load_file(self, path):
         self.current_file = path
-        self.processed_tree = None
         self.save_btn.state(['disabled'])
         name = os.path.basename(path)
         self.file_label.configure(text=name, foreground='black')
@@ -1026,8 +1048,6 @@ class SVGPathFixerGUI:
             self.summary_label.configure(text="Analyzing...", foreground='gray')
         else:
             self._set_analysis_text("Analyzing\u2026")
-
-        self.process_btn.state(['disabled'])
 
         t = threading.Thread(target=self._run_analysis, args=(path,), daemon=True)
         t.start()
@@ -1052,10 +1072,15 @@ class SVGPathFixerGUI:
             return
 
         self.analysis = result
-        self.process_btn.state(['!disabled'])
+        self.save_btn.state(['!disabled'])
 
         # Store raw commands for preview subprocess
         self._raw_group_cmds = result.get('group_cmds')
+
+        # Reset view for new file
+        self._view_zoom = 1.0
+        self._view_pan_x = 0.0
+        self._view_pan_y = 0.0
 
         if MPL_AVAILABLE:
             self._on_analysis_done_charts(result)
@@ -1205,126 +1230,14 @@ class SVGPathFixerGUI:
 
     # ── Processing ────────────────────────────────────────────────
 
-    def on_process(self):
-        if not self.analysis or 'tree' not in self.analysis:
-            messagebox.showwarning("No file", "Load an SVG file first.")
-            return
-
-        threshold = self.threshold
-        simplify = self.simplify if self.enable_simplify_var.get() else None
-        graph_tol = self.graph_tol
-
-        self.process_btn.state(['disabled'])
-        self.save_btn.state(['disabled'])
-        self.log(f"\nProcessing with threshold={threshold:.6g}, "
-                 f"simplify={simplify}, graph_tol={graph_tol:.6g}")
-
-        t = threading.Thread(
-            target=self._run_process,
-            args=(threshold, simplify, graph_tol),
-            daemon=True,
-        )
-        t.start()
-
-    def _run_process(self, threshold, simplify, graph_tol):
-        try:
-            tree = self.analysis['tree']
-            root = tree.getroot()
-            paths = root.findall('.//{http://www.w3.org/2000/svg}path')
-            if not paths:
-                paths = root.findall('.//path')
-
-            # Build parent map (ElementTree has no getparent())
-            parent_map = {child: parent for parent in root.iter() for child in parent}
-
-            # Group paths by visual attributes, merge commands within each group
-            groups = _group_paths(paths)
-            total_output_paths = 0
-
-            for gi, (attrs, cmds, elements) in enumerate(groups):
-                total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"\nGroup #{gi + 1} ({len(elements)} paths merged, "
-                               f"{len(cmds)} commands, {total_m + 1} subpaths):")
-
-                # Step 1
-                cmds, micro_joined = join_by_threshold(cmds, threshold)
-                self._log_safe(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
-                remaining = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Remaining separate subpaths: {remaining + 1}")
-
-                # Step 2
-                cmds, traced = trace_graph(cmds, tol=graph_tol)
-                remaining2 = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Graph-traced: {traced} merged "
-                               f"({remaining + 1} -> {remaining2 + 1} subpaths)")
-
-                # Step 3: deduplicate near-coincident endpoints
-                before3 = len(cmds)
-                cmds, deduped = deduplicate_endpoints(cmds)
-                if deduped:
-                    self._log_safe(f"  Near-duplicate endpoints removed: {deduped} "
-                                   f"({before3} -> {len(cmds)} commands)")
-
-                # Step 4
-                if simplify is not None and simplify > 0:
-                    before = len(cmds)
-                    cmds, removed = simplify_short_runs(cmds, simplify)
-                    self._log_safe(f"  Simplified: {removed} segments removed "
-                                   f"({before} -> {len(cmds)} commands)")
-
-                # Step 5: close near-closed subpaths
-                cmds, closed_count = close_subpaths(cmds)
-                if closed_count:
-                    self._log_safe(f"  Subpaths closed (start~=end): {closed_count}")
-
-                # Split result into continuous sections → one <path> per subpath
-                result_subpaths = split_into_subpaths(cmds)
-                self._log_safe(f"  Output: {len(result_subpaths)} continuous path(s)")
-                total_output_paths += len(result_subpaths)
-
-                # Remove all original path elements in this group
-                insert_parent = parent_map[elements[0]]
-                for el in elements:
-                    parent_map[el].remove(el)
-
-                # Insert new path elements (one per continuous section)
-                tag = elements[0].tag
-                for sp in result_subpaths:
-                    new_el = ET.SubElement(insert_parent, tag)
-                    new_el.set('d', cmds_to_str(sp))
-                    for k, v in attrs.items():
-                        new_el.set(k, v)
-
-            self._log_safe(f"\nTotal output: {total_output_paths} path element(s)")
-            self.root.after(0, self._on_process_done, tree)
-        except Exception as e:
-            self.root.after(0, self._on_process_error, str(e))
-
-    def _log_safe(self, msg):
-        """Thread-safe logging."""
-        self.root.after(0, self.log, msg)
-
-    def _on_process_error(self, err):
-        self.log(f"Processing error: {err}")
-        self.process_btn.state(['!disabled'])
-
-    def _on_process_done(self, tree):
-        self.processed_tree = tree
-        self.log("\nProcessing complete.")
-        self.process_btn.state(['!disabled'])
-        self.save_btn.state(['!disabled'])
-
     # ── Save ──────────────────────────────────────────────────────
 
     def on_save(self):
-        if self.processed_tree is None:
+        if not self.current_file or not self.analysis:
             return
 
-        if self.current_file:
-            base, ext = os.path.splitext(self.current_file)
-            suggestion = base + '_fixed' + ext
-        else:
-            suggestion = 'output.svg'
+        base, ext = os.path.splitext(self.current_file)
+        suggestion = base + '_fixed' + ext
 
         path = filedialog.asksaveasfilename(
             title="Save fixed SVG",
@@ -1336,9 +1249,91 @@ class SVGPathFixerGUI:
         if not path:
             return
 
-        ET.register_namespace('', 'http://www.w3.org/2000/svg')
-        self.processed_tree.write(path, xml_declaration=False, encoding='unicode')
-        self.log(f"Saved: {path}")
+        threshold = self.threshold
+        simplify = self.simplify if self.enable_simplify_var.get() else None
+        graph_tol = self.graph_tol
+
+        self.save_btn.state(['disabled'])
+        self.log(f"\nSaving with threshold={threshold:.6g}, "
+                 f"simplify={simplify}, graph_tol={graph_tol:.6g}")
+
+        t = threading.Thread(
+            target=self._run_save,
+            args=(path, threshold, simplify, graph_tol),
+            daemon=True,
+        )
+        t.start()
+
+    def _run_save(self, save_path, threshold, simplify, graph_tol):
+        try:
+            # Re-parse the original file so the analysis tree stays pristine
+            ET.register_namespace('', 'http://www.w3.org/2000/svg')
+            tree = ET.parse(self.current_file)
+            root = tree.getroot()
+            paths = root.findall('.//{http://www.w3.org/2000/svg}path')
+            if not paths:
+                paths = root.findall('.//path')
+
+            parent_map = {child: parent for parent in root.iter() for child in parent}
+            groups = _group_paths(paths)
+            total_output_paths = 0
+
+            for gi, (attrs, cmds, elements) in enumerate(groups):
+                total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
+                self._log_safe(f"\nGroup #{gi + 1} ({len(elements)} paths merged, "
+                               f"{len(cmds)} commands, {total_m + 1} subpaths):")
+
+                cmds, micro_joined = join_by_threshold(cmds, threshold)
+                self._log_safe(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
+                remaining = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
+                self._log_safe(f"  Remaining separate subpaths: {remaining + 1}")
+
+                cmds, traced = trace_graph(cmds, tol=graph_tol)
+                remaining2 = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
+                self._log_safe(f"  Graph-traced: {traced} merged "
+                               f"({remaining + 1} -> {remaining2 + 1} subpaths)")
+
+                before3 = len(cmds)
+                cmds, deduped = deduplicate_endpoints(cmds)
+                if deduped:
+                    self._log_safe(f"  Near-duplicate endpoints removed: {deduped} "
+                                   f"({before3} -> {len(cmds)} commands)")
+
+                if simplify is not None and simplify > 0:
+                    before = len(cmds)
+                    cmds, removed = simplify_short_runs(cmds, simplify)
+                    self._log_safe(f"  Simplified: {removed} segments removed "
+                                   f"({before} -> {len(cmds)} commands)")
+
+                cmds, closed_count = close_subpaths(cmds)
+                if closed_count:
+                    self._log_safe(f"  Subpaths closed (start~=end): {closed_count}")
+
+                result_subpaths = split_into_subpaths(cmds)
+                self._log_safe(f"  Output: {len(result_subpaths)} continuous path(s)")
+                total_output_paths += len(result_subpaths)
+
+                insert_parent = parent_map[elements[0]]
+                for el in elements:
+                    parent_map[el].remove(el)
+
+                tag = elements[0].tag
+                for sp in result_subpaths:
+                    new_el = ET.SubElement(insert_parent, tag)
+                    new_el.set('d', cmds_to_str(sp))
+                    for k, v in attrs.items():
+                        new_el.set(k, v)
+
+            tree.write(save_path, xml_declaration=False, encoding='unicode')
+            self._log_safe(f"\nSaved {total_output_paths} path(s) to: {save_path}")
+            self.root.after(0, lambda: self.save_btn.state(['!disabled']))
+        except Exception as e:
+            self._log_safe(f"Save error: {e}")
+            self.root.after(0, lambda: self.save_btn.state(['!disabled']))
+
+    def _log_safe(self, msg):
+        """Thread-safe logging."""
+        self.root.after(0, self.log, msg)
 
 
 # ── Entry point ───────────────────────────────────────────────────────
