@@ -1,8 +1,8 @@
 """
 Tkinter GUI for SVG Path Fixer.
 
-Loads an SVG, auto-analyzes gap and segment distributions to recommend
-parameters, then processes the path using fix_path's 5-step pipeline.
+Loads an SVG, auto-analyzes gap, segment, and endpoint distributions to
+recommend parameters, then processes the path using fix_path's 5-step pipeline.
 Displays interactive histograms with log-scale sliders for picking values.
 """
 
@@ -21,6 +21,7 @@ from fix_path import (
     parse_commands, get_endpoint, dist, cmds_to_str,
     join_by_threshold, trace_graph, deduplicate_endpoints,
     simplify_short_runs, close_subpaths, split_into_subpaths,
+    subpath_endpoints,
 )
 
 # Optional drag & drop support
@@ -54,8 +55,7 @@ COLOR_LINE = '#D32F2F'
 def _find_cluster_boundary(values):
     """Find the index of the largest gap between consecutive sorted values.
 
-    Uses log-scale jumps so it works across orders of magnitude
-    (e.g. gaps of 0.005 vs 1.5 vs 200 all get detected correctly).
+    Uses log-scale jumps so it works across orders of magnitude.
     Falls back to absolute jumps if all values are zero/negative.
     Returns the index i such that the split is values[:i+1] | values[i+1:].
     """
@@ -77,6 +77,7 @@ def _find_cluster_boundary(values):
             best_idx = i
 
     return best_idx
+
 
 def analyze_gap_distribution(cmds):
     """Analyze M-command gap distances and recommend a join threshold."""
@@ -155,6 +156,59 @@ def analyze_segment_distribution(cmds):
     }
 
 
+def analyze_endpoint_distribution(cmds):
+    """Nearest-neighbor distances between subpath endpoints.
+
+    For each subpath endpoint, find the distance to the closest endpoint
+    on a different subpath. This measures how well trace_graph can merge
+    subpaths at a given tolerance.
+    """
+    subpaths = split_into_subpaths(cmds)
+    if len(subpaths) < 2:
+        return None
+
+    # Collect all endpoints: (x, y, subpath_index)
+    pts = []
+    for i, sp in enumerate(subpaths):
+        start, end = subpath_endpoints(sp)
+        pts.append((start[0], start[1], i))
+        pts.append((end[0], end[1], i))
+
+    # For each point, find min distance to any point from a different subpath
+    nn_dists = []
+    for i, (x1, y1, sp1) in enumerate(pts):
+        min_d = float('inf')
+        for j, (x2, y2, sp2) in enumerate(pts):
+            if sp1 == sp2:
+                continue
+            d = dist(x1, y1, x2, y2)
+            if d < min_d:
+                min_d = d
+        if min_d < float('inf'):
+            nn_dists.append(min_d)
+
+    if len(nn_dists) < 2:
+        return None
+
+    nn_dists.sort()
+    boundary_idx = _find_cluster_boundary(nn_dists)
+    boundary = (nn_dists[boundary_idx] + nn_dists[boundary_idx + 1]) / 2
+    rec = nn_dists[boundary_idx] * 1.05
+
+    matched = [d for d in nn_dists if d <= boundary]
+    unmatched = [d for d in nn_dists if d > boundary]
+
+    return {
+        'distances': nn_dists,
+        'matched_count': len(matched),
+        'unmatched_count': len(unmatched),
+        'matched_max': matched[-1] if matched else 0,
+        'unmatched_min': unmatched[0] if unmatched else 0,
+        'boundary': boundary,
+        'recommended_tolerance': round(rec, 6),
+    }
+
+
 def auto_analyze_svg(svg_path):
     """Full auto-analysis on an SVG file. Returns analysis dict."""
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
@@ -179,6 +233,13 @@ def auto_analyze_svg(svg_path):
     gap_analysis = analyze_gap_distribution(cmds)
     seg_analysis = analyze_segment_distribution(cmds)
 
+    # Endpoint analysis runs on gap-joined commands (trace_graph's input)
+    if gap_analysis:
+        joined_cmds, _ = join_by_threshold(cmds, gap_analysis['recommended_threshold'])
+    else:
+        joined_cmds = cmds
+    endpoint_analysis = analyze_endpoint_distribution(joined_cmds)
+
     return {
         'tree': tree,
         'path_count': len(paths),
@@ -187,6 +248,7 @@ def auto_analyze_svg(svg_path):
         'm_breaks': total_m,
         'gap_analysis': gap_analysis,
         'segment_analysis': seg_analysis,
+        'endpoint_analysis': endpoint_analysis,
     }
 
 
@@ -197,8 +259,8 @@ class SVGPathFixerGUI:
         self.root = root
         self.root.title("SVG Path Fixer")
         if MPL_AVAILABLE:
-            self.root.geometry("1050x780")
-            self.root.minsize(800, 600)
+            self.root.geometry("1200x780")
+            self.root.minsize(900, 600)
         else:
             self.root.geometry("820x680")
             self.root.minsize(600, 500)
@@ -207,13 +269,22 @@ class SVGPathFixerGUI:
         self.analysis = None
         self.processed_tree = None
 
+        # Current parameter values (set by sliders)
+        self.threshold = 0.5
+        self.simplify = 0.5
+        self.graph_tol = 0.1
+        self.simplify_enabled = True
+
         # Chart state
         self.gap_data = None
         self.seg_data = None
+        self.tol_data = None
         self.gap_slider_range = (1e-6, 200.0)
         self.seg_slider_range = (1e-6, 200.0)
+        self.tol_slider_range = (1e-6, 200.0)
         self._updating_threshold = False
         self._updating_simplify = False
+        self._updating_tol = False
 
         # Chart artist references
         self.gap_bars = None
@@ -221,11 +292,18 @@ class SVGPathFixerGUI:
         self.gap_left_txt = None
         self.gap_right_txt = None
         self.gap_bin_centers = None
+
         self.seg_bars = None
         self.seg_vline = None
         self.seg_left_txt = None
         self.seg_right_txt = None
         self.seg_bin_centers = None
+
+        self.tol_bars = None
+        self.tol_vline = None
+        self.tol_left_txt = None
+        self.tol_right_txt = None
+        self.tol_bin_centers = None
 
         self.setup_ui()
 
@@ -276,50 +354,6 @@ class SVGPathFixerGUI:
         else:
             self._setup_text_analysis_frame(pad)
 
-        # -- Parameters frame --
-        par = ttk.LabelFrame(self.root, text="Parameters", padding=6)
-        par.pack(fill='x', **pad)
-
-        grid = ttk.Frame(par)
-        grid.pack(fill='x')
-
-        # Threshold
-        ttk.Label(grid, text="Threshold (gap join):").grid(row=0, column=0, sticky='w')
-        self.threshold_var = tk.StringVar(value="0.5")
-        self.threshold_entry = ttk.Entry(grid, textvariable=self.threshold_var, width=12)
-        self.threshold_entry.grid(row=0, column=1, padx=4)
-
-        # Simplify
-        ttk.Label(grid, text="Simplify (segment):").grid(row=1, column=0, sticky='w', pady=2)
-        self.simplify_var = tk.StringVar(value="0.5")
-        self.simplify_entry = ttk.Entry(grid, textvariable=self.simplify_var, width=12)
-        self.simplify_entry.grid(row=1, column=1, padx=4, pady=2)
-        self.enable_simplify_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(grid, text="Enable", variable=self.enable_simplify_var).grid(row=1, column=2, pady=2)
-
-        # Graph tolerance
-        ttk.Label(grid, text="Graph tolerance:").grid(row=2, column=0, sticky='w', pady=2)
-        self.graph_tol_var = tk.StringVar(value="0.1")
-        ttk.Entry(grid, textvariable=self.graph_tol_var, width=12).grid(row=2, column=1, padx=4, pady=2)
-
-        # Buttons
-        btn_frame = ttk.Frame(par)
-        btn_frame.pack(fill='x', pady=(8, 0))
-
-        self.process_btn = ttk.Button(btn_frame, text="Process", command=self.on_process)
-        self.process_btn.pack(side='left', padx=(0, 6))
-        self.process_btn.state(['disabled'])
-
-        self.save_btn = ttk.Button(btn_frame, text="Save As\u2026", command=self.on_save)
-        self.save_btn.pack(side='right')
-        self.save_btn.state(['disabled'])
-
-        # Wire up trace callbacks for bidirectional sync
-        if MPL_AVAILABLE:
-            self.threshold_var.trace_add('write', self._on_threshold_entry_change)
-            self.simplify_var.trace_add('write', self._on_simplify_entry_change)
-            self.enable_simplify_var.trace_add('write', self._on_enable_simplify_toggle)
-
         # -- Log frame --
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=6)
         log_frame.pack(fill='both', expand=True, **pad)
@@ -329,39 +363,38 @@ class SVGPathFixerGUI:
         self.log_text.pack(fill='both', expand=True)
 
     def _setup_charts_frame(self, pad):
-        """Create the matplotlib charts frame with sliders and summary label."""
+        """Create the matplotlib charts frame with 3 charts, sliders, and buttons."""
         charts = ttk.LabelFrame(self.root, text="Distribution Analysis", padding=6)
         charts.pack(fill='x', **pad)
 
-        # Matplotlib figure with two side-by-side axes
-        self.fig = Figure(figsize=(10, 3.0), dpi=96)
-        self.ax_gap = self.fig.add_subplot(1, 2, 1)
-        self.ax_seg = self.fig.add_subplot(1, 2, 2)
-        self.fig.subplots_adjust(left=0.07, right=0.97, bottom=0.18, top=0.88, wspace=0.30)
+        # Matplotlib figure with three side-by-side axes
+        self.fig = Figure(figsize=(14, 3.0), dpi=96)
+        self.ax_gap = self.fig.add_subplot(1, 3, 1)
+        self.ax_seg = self.fig.add_subplot(1, 3, 2)
+        self.ax_tol = self.fig.add_subplot(1, 3, 3)
+        self.fig.subplots_adjust(left=0.05, right=0.98, bottom=0.18, top=0.88, wspace=0.28)
 
         # Initial placeholder text
-        self.ax_gap.text(0.5, 0.5, 'Load an SVG to see\ngap distribution',
-                         transform=self.ax_gap.transAxes, ha='center', va='center',
-                         fontsize=10, color='gray')
-        self.ax_gap.set_xticks([])
-        self.ax_gap.set_yticks([])
-        self.ax_seg.text(0.5, 0.5, 'Load an SVG to see\nsegment distribution',
-                         transform=self.ax_seg.transAxes, ha='center', va='center',
-                         fontsize=10, color='gray')
-        self.ax_seg.set_xticks([])
-        self.ax_seg.set_yticks([])
+        for ax, label in [(self.ax_gap, 'gap distribution'),
+                          (self.ax_seg, 'segment distribution'),
+                          (self.ax_tol, 'endpoint distances')]:
+            ax.text(0.5, 0.5, f'Load an SVG to see\n{label}',
+                    transform=ax.transAxes, ha='center', va='center',
+                    fontsize=10, color='gray')
+            ax.set_xticks([])
+            ax.set_yticks([])
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=charts)
         self.canvas.get_tk_widget().pack(fill='x')
         self.canvas.draw()
 
-        # Slider frame
+        # Slider frame — three columns
         slider_frame = ttk.Frame(charts)
         slider_frame.pack(fill='x', pady=(2, 0))
 
-        # Gap slider (left half)
+        # Gap slider
         gap_sf = ttk.Frame(slider_frame)
-        gap_sf.pack(side='left', fill='x', expand=True, padx=(0, 10))
+        gap_sf.pack(side='left', fill='x', expand=True, padx=(0, 6))
         ttk.Label(gap_sf, text="Threshold:", font=('', 8)).pack(side='left')
         self.gap_slider = tk.Scale(gap_sf, from_=0, to=SLIDER_STEPS,
                                     orient='horizontal', showvalue=False,
@@ -371,9 +404,9 @@ class SVGPathFixerGUI:
                                            font=('Consolas', 8))
         self.gap_slider_label.pack(side='left', padx=(4, 0))
 
-        # Segment slider (right half)
+        # Segment slider
         seg_sf = ttk.Frame(slider_frame)
-        seg_sf.pack(side='left', fill='x', expand=True, padx=(10, 0))
+        seg_sf.pack(side='left', fill='x', expand=True, padx=(6, 6))
         ttk.Label(seg_sf, text="Simplify:", font=('', 8)).pack(side='left')
         self.seg_slider = tk.Scale(seg_sf, from_=0, to=SLIDER_STEPS,
                                     orient='horizontal', showvalue=False,
@@ -383,19 +416,66 @@ class SVGPathFixerGUI:
                                            font=('Consolas', 8))
         self.seg_slider_label.pack(side='left', padx=(4, 0))
 
+        # Tolerance slider
+        tol_sf = ttk.Frame(slider_frame)
+        tol_sf.pack(side='left', fill='x', expand=True, padx=(6, 0))
+        ttk.Label(tol_sf, text="Tolerance:", font=('', 8)).pack(side='left')
+        self.tol_slider = tk.Scale(tol_sf, from_=0, to=SLIDER_STEPS,
+                                    orient='horizontal', showvalue=False,
+                                    command=self._on_tol_slider_move)
+        self.tol_slider.pack(side='left', fill='x', expand=True)
+        self.tol_slider_label = ttk.Label(tol_sf, text="--", width=10,
+                                           font=('Consolas', 8))
+        self.tol_slider_label.pack(side='left', padx=(4, 0))
+
+        # Options + buttons row
+        bottom_frame = ttk.Frame(charts)
+        bottom_frame.pack(fill='x', pady=(6, 0))
+
+        # Enable simplify checkbox
+        self.enable_simplify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom_frame, text="Enable simplify",
+                         variable=self.enable_simplify_var,
+                         command=self._on_enable_simplify_toggle).pack(side='left')
+
         # Summary label
-        self.summary_label = ttk.Label(charts, text="Load an SVG to begin analysis",
+        self.summary_label = ttk.Label(bottom_frame, text="Load an SVG to begin analysis",
                                         foreground='gray', font=('Consolas', 9))
-        self.summary_label.pack(fill='x', pady=(4, 0))
+        self.summary_label.pack(side='left', padx=(16, 16), fill='x', expand=True)
+
+        # Buttons
+        self.save_btn = ttk.Button(bottom_frame, text="Save As\u2026", command=self.on_save)
+        self.save_btn.pack(side='right', padx=(6, 0))
+        self.save_btn.state(['disabled'])
+
+        self.process_btn = ttk.Button(bottom_frame, text="Process", command=self.on_process)
+        self.process_btn.pack(side='right')
+        self.process_btn.state(['disabled'])
 
     def _setup_text_analysis_frame(self, pad):
         """Fallback: plain text analysis when matplotlib is not available."""
         ana = ttk.LabelFrame(self.root, text="Auto-Analysis", padding=6)
         ana.pack(fill='x', **pad)
 
-        self.analysis_text = tk.Text(ana, height=5, wrap='word', state='disabled',
+        self.analysis_text = tk.Text(ana, height=6, wrap='word', state='disabled',
                                      bg='#f5f5f5', relief='flat', font=('Consolas', 9))
         self.analysis_text.pack(fill='x')
+
+        # Enable simplify + buttons for text fallback
+        btn_frame = ttk.Frame(ana)
+        btn_frame.pack(fill='x', pady=(6, 0))
+
+        self.enable_simplify_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btn_frame, text="Enable simplify",
+                         variable=self.enable_simplify_var).pack(side='left')
+
+        self.save_btn = ttk.Button(btn_frame, text="Save As\u2026", command=self.on_save)
+        self.save_btn.pack(side='right', padx=(6, 0))
+        self.save_btn.state(['disabled'])
+
+        self.process_btn = ttk.Button(btn_frame, text="Process", command=self.on_process)
+        self.process_btn.pack(side='right')
+        self.process_btn.state(['disabled'])
 
     # ── Histogram drawing ────────────────────────────────────────
 
@@ -438,94 +518,63 @@ class SVGPathFixerGUI:
 
         return list(bars), vline, ltxt, rtxt, centers
 
-    def _update_gap_chart(self, threshold):
-        """Partial redraw: move line, recolor bars, update count labels."""
-        if self.gap_bars is None or self.gap_data is None:
+    def _update_chart(self, bars, vline, left_txt, right_txt, bin_centers,
+                      data, threshold, left_label, right_label):
+        """Generic partial redraw for any chart."""
+        if bars is None or data is None:
             return
-        self.gap_vline.set_xdata([threshold, threshold])
-        for bar, center in zip(self.gap_bars, self.gap_bin_centers):
+        vline.set_xdata([threshold, threshold])
+        for bar, center in zip(bars, bin_centers):
             bar.set_facecolor(COLOR_BELOW if center < threshold else COLOR_ABOVE)
-        below = sum(1 for v in self.gap_data if v <= threshold)
-        above = len(self.gap_data) - below
-        self.gap_left_txt.set_text(f'{below} micro')
-        self.gap_right_txt.set_text(f'{above} structural')
-        self.canvas.draw_idle()
-
-    def _update_seg_chart(self, simplify):
-        """Partial redraw: move line, recolor bars, update count labels."""
-        if self.seg_bars is None or self.seg_data is None:
-            return
-        self.seg_vline.set_xdata([simplify, simplify])
-        for bar, center in zip(self.seg_bars, self.seg_bin_centers):
-            bar.set_facecolor(COLOR_BELOW if center < simplify else COLOR_ABOVE)
-        below = sum(1 for v in self.seg_data if v <= simplify)
-        above = len(self.seg_data) - below
-        self.seg_left_txt.set_text(f'{below} jitter')
-        self.seg_right_txt.set_text(f'{above} structural')
+        below = sum(1 for v in data if v <= threshold)
+        above = len(data) - below
+        left_txt.set_text(f'{below} {left_label}')
+        right_txt.set_text(f'{above} {right_label}')
         self.canvas.draw_idle()
 
     # ── Slider callbacks ─────────────────────────────────────────
 
     def _on_gap_slider_move(self, pos):
-        if self._updating_threshold:
-            return
-        if self.gap_data is None:
+        if self._updating_threshold or self.gap_data is None:
             return
         self._updating_threshold = True
         value = self._slider_to_value(int(float(pos)), *self.gap_slider_range)
-        self.threshold_var.set(f"{value:.6g}")
+        self.threshold = value
         self.gap_slider_label.configure(text=f"{value:.4g}")
-        self._update_gap_chart(value)
+        self._update_chart(self.gap_bars, self.gap_vline, self.gap_left_txt,
+                           self.gap_right_txt, self.gap_bin_centers,
+                           self.gap_data, value, 'micro', 'structural')
         self._updating_threshold = False
 
     def _on_seg_slider_move(self, pos):
-        if self._updating_simplify:
-            return
-        if self.seg_data is None:
+        if self._updating_simplify or self.seg_data is None:
             return
         self._updating_simplify = True
         value = self._slider_to_value(int(float(pos)), *self.seg_slider_range)
-        self.simplify_var.set(f"{value:.6g}")
+        self.simplify = value
         self.seg_slider_label.configure(text=f"{value:.4g}")
-        self._update_seg_chart(value)
+        self._update_chart(self.seg_bars, self.seg_vline, self.seg_left_txt,
+                           self.seg_right_txt, self.seg_bin_centers,
+                           self.seg_data, value, 'jitter', 'structural')
         self._updating_simplify = False
 
-    def _on_threshold_entry_change(self, *_args):
-        if self._updating_threshold:
+    def _on_tol_slider_move(self, pos):
+        if self._updating_tol or self.tol_data is None:
             return
-        if self.gap_data is None:
-            return
-        try:
-            value = float(self.threshold_var.get())
-        except ValueError:
-            return
-        self._updating_threshold = True
-        slider_pos = self._value_to_slider(value, *self.gap_slider_range)
-        self.gap_slider.set(slider_pos)
-        self.gap_slider_label.configure(text=f"{value:.4g}")
-        self._update_gap_chart(value)
-        self._updating_threshold = False
-
-    def _on_simplify_entry_change(self, *_args):
-        if self._updating_simplify:
-            return
-        if self.seg_data is None:
-            return
-        try:
-            value = float(self.simplify_var.get())
-        except ValueError:
-            return
-        self._updating_simplify = True
-        slider_pos = self._value_to_slider(value, *self.seg_slider_range)
-        self.seg_slider.set(slider_pos)
-        self.seg_slider_label.configure(text=f"{value:.4g}")
-        self._update_seg_chart(value)
-        self._updating_simplify = False
+        self._updating_tol = True
+        value = self._slider_to_value(int(float(pos)), *self.tol_slider_range)
+        self.graph_tol = value
+        self.tol_slider_label.configure(text=f"{value:.4g}")
+        self._update_chart(self.tol_bars, self.tol_vline, self.tol_left_txt,
+                           self.tol_right_txt, self.tol_bin_centers,
+                           self.tol_data, value, 'matched', 'unmatched')
+        self._updating_tol = False
 
     # ── Enable checkbox callback ─────────────────────────────────
 
-    def _on_enable_simplify_toggle(self, *_args):
+    def _on_enable_simplify_toggle(self):
         enabled = self.enable_simplify_var.get()
+        self.simplify_enabled = enabled
         if self.seg_bars is not None:
             alpha = 1.0 if enabled else 0.25
             for bar in self.seg_bars:
@@ -540,10 +589,8 @@ class SVGPathFixerGUI:
 
         if enabled:
             self.seg_slider.configure(state='normal')
-            self.simplify_entry.configure(state='normal')
         else:
             self.seg_slider.configure(state='disabled')
-            self.simplify_entry.configure(state='disabled')
 
     # ── Logging ───────────────────────────────────────────────────
 
@@ -634,8 +681,16 @@ class SVGPathFixerGUI:
 
         self.log("Analysis complete.")
 
+    def _set_slider(self, slider, label, value, slider_range, updating_attr):
+        """Helper to set a slider position without triggering callbacks."""
+        setattr(self, updating_attr, True)
+        slider_pos = self._value_to_slider(value, *slider_range)
+        slider.set(slider_pos)
+        label.configure(text=f"{value:.4g}")
+        setattr(self, updating_attr, False)
+
     def _on_analysis_done_charts(self, result):
-        """Populate charts from analysis results."""
+        """Populate all three charts from analysis results."""
         self.summary_label.configure(
             text=f"Paths: {result['path_count']}   "
                  f"Commands: {result['command_count']}   "
@@ -649,28 +704,16 @@ class SVGPathFixerGUI:
             vmin = max(min(self.gap_data) * 0.5, 1e-6)
             vmax = max(self.gap_data) * 2.0
             self.gap_slider_range = (vmin, vmax)
-
-            threshold = ga['recommended_threshold']
-            self._updating_threshold = True
-            self.threshold_var.set(f"{threshold:.6g}")
-            self._updating_threshold = False
+            self.threshold = ga['recommended_threshold']
 
             self.gap_bars, self.gap_vline, self.gap_left_txt, self.gap_right_txt, \
                 self.gap_bin_centers = self._draw_histogram(
-                    self.ax_gap, self.gap_data, threshold,
+                    self.ax_gap, self.gap_data, self.threshold,
                     'Gap Distribution', 'micro', 'structural')
-
-            self._updating_threshold = True
-            slider_pos = self._value_to_slider(threshold, *self.gap_slider_range)
-            self.gap_slider.set(slider_pos)
-            self.gap_slider_label.configure(text=f"{threshold:.4g}")
-            self._updating_threshold = False
+            self._set_slider(self.gap_slider, self.gap_slider_label,
+                             self.threshold, self.gap_slider_range, '_updating_threshold')
         else:
-            self.ax_gap.clear()
-            self.ax_gap.text(0.5, 0.5, 'No gap data', transform=self.ax_gap.transAxes,
-                             ha='center', va='center', fontsize=10, color='gray')
-            self.ax_gap.set_xticks([])
-            self.ax_gap.set_yticks([])
+            self._show_placeholder(self.ax_gap, 'No gap data')
 
         # Segment chart
         sa = result['segment_analysis']
@@ -679,40 +722,51 @@ class SVGPathFixerGUI:
             vmin = max(min(self.seg_data) * 0.5, 1e-6)
             vmax = max(self.seg_data) * 2.0
             self.seg_slider_range = (vmin, vmax)
-
-            simplify = sa['recommended_simplify']
-            self._updating_simplify = True
-            self.simplify_var.set(f"{simplify:.6g}")
-            self._updating_simplify = False
+            self.simplify = sa['recommended_simplify']
 
             self.seg_bars, self.seg_vline, self.seg_left_txt, self.seg_right_txt, \
                 self.seg_bin_centers = self._draw_histogram(
-                    self.ax_seg, self.seg_data, simplify,
+                    self.ax_seg, self.seg_data, self.simplify,
                     'Segment Distribution', 'jitter', 'structural')
-
-            self._updating_simplify = True
-            slider_pos = self._value_to_slider(simplify, *self.seg_slider_range)
-            self.seg_slider.set(slider_pos)
-            self.seg_slider_label.configure(text=f"{simplify:.4g}")
-            self._updating_simplify = False
+            self._set_slider(self.seg_slider, self.seg_slider_label,
+                             self.simplify, self.seg_slider_range, '_updating_simplify')
 
             if not self.enable_simplify_var.get():
-                for bar in self.seg_bars:
-                    bar.set_alpha(0.25)
-                if self.seg_vline:
-                    self.seg_vline.set_alpha(0.25)
-                if self.seg_left_txt:
-                    self.seg_left_txt.set_alpha(0.25)
-                if self.seg_right_txt:
-                    self.seg_right_txt.set_alpha(0.25)
+                for artist in (self.seg_bars or []):
+                    artist.set_alpha(0.25)
+                for artist in [self.seg_vline, self.seg_left_txt, self.seg_right_txt]:
+                    if artist:
+                        artist.set_alpha(0.25)
         else:
-            self.ax_seg.clear()
-            self.ax_seg.text(0.5, 0.5, 'No segment data', transform=self.ax_seg.transAxes,
-                             ha='center', va='center', fontsize=10, color='gray')
-            self.ax_seg.set_xticks([])
-            self.ax_seg.set_yticks([])
+            self._show_placeholder(self.ax_seg, 'No segment data')
+
+        # Endpoint / tolerance chart
+        ea = result['endpoint_analysis']
+        if ea and len(ea['distances']) >= 2:
+            self.tol_data = ea['distances']
+            vmin = max(min(self.tol_data) * 0.5, 1e-6)
+            vmax = max(self.tol_data) * 2.0
+            self.tol_slider_range = (vmin, vmax)
+            self.graph_tol = ea['recommended_tolerance']
+
+            self.tol_bars, self.tol_vline, self.tol_left_txt, self.tol_right_txt, \
+                self.tol_bin_centers = self._draw_histogram(
+                    self.ax_tol, self.tol_data, self.graph_tol,
+                    'Endpoint Distance', 'matched', 'unmatched')
+            self._set_slider(self.tol_slider, self.tol_slider_label,
+                             self.graph_tol, self.tol_slider_range, '_updating_tol')
+        else:
+            self._show_placeholder(self.ax_tol, 'No endpoint data')
 
         self.canvas.draw()
+
+    def _show_placeholder(self, ax, message):
+        """Show placeholder text in an empty chart."""
+        ax.clear()
+        ax.text(0.5, 0.5, message, transform=ax.transAxes,
+                ha='center', va='center', fontsize=10, color='gray')
+        ax.set_xticks([])
+        ax.set_yticks([])
 
     def _on_analysis_done_text(self, result):
         """Fallback: populate text widget when matplotlib is unavailable."""
@@ -728,7 +782,7 @@ class SVGPathFixerGUI:
                           f"{ga['structural_count']} structural "
                           f"(>= {ga['structural_min']:.4g})")
             lines.append(f"  -> Recommended threshold: {ga['recommended_threshold']:.6g}")
-            self.threshold_var.set(f"{ga['recommended_threshold']:.6g}")
+            self.threshold = ga['recommended_threshold']
         else:
             lines.append("Gaps: none detected")
 
@@ -739,9 +793,20 @@ class SVGPathFixerGUI:
                           f"{sa['structural_count']} structural "
                           f"(>= {sa['structural_min']:.4g})")
             lines.append(f"  -> Recommended simplify: {sa['recommended_simplify']:.6g}")
-            self.simplify_var.set(f"{sa['recommended_simplify']:.6g}")
+            self.simplify = sa['recommended_simplify']
         else:
             lines.append("Segments: no line segments found")
+
+        ea = result['endpoint_analysis']
+        if ea:
+            lines.append(f"Endpoints: {ea['matched_count']} matched "
+                          f"(<= {ea['matched_max']:.4g}),  "
+                          f"{ea['unmatched_count']} unmatched "
+                          f"(>= {ea['unmatched_min']:.4g})")
+            lines.append(f"  -> Recommended tolerance: {ea['recommended_tolerance']:.6g}")
+            self.graph_tol = ea['recommended_tolerance']
+        else:
+            lines.append("Endpoints: insufficient data")
 
         self._set_analysis_text('\n'.join(lines))
 
@@ -752,29 +817,14 @@ class SVGPathFixerGUI:
             messagebox.showwarning("No file", "Load an SVG file first.")
             return
 
-        try:
-            threshold = float(self.threshold_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid", "Threshold must be a number.")
-            return
-
-        simplify = None
-        if self.enable_simplify_var.get():
-            try:
-                simplify = float(self.simplify_var.get())
-            except ValueError:
-                messagebox.showerror("Invalid", "Simplify must be a number.")
-                return
-
-        try:
-            graph_tol = float(self.graph_tol_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid", "Graph tolerance must be a number.")
-            return
+        threshold = self.threshold
+        simplify = self.simplify if self.enable_simplify_var.get() else None
+        graph_tol = self.graph_tol
 
         self.process_btn.state(['disabled'])
         self.save_btn.state(['disabled'])
-        self.log(f"\nProcessing with threshold={threshold}, simplify={simplify}, graph_tol={graph_tol}")
+        self.log(f"\nProcessing with threshold={threshold:.6g}, "
+                 f"simplify={simplify}, graph_tol={graph_tol:.6g}")
 
         t = threading.Thread(
             target=self._run_process,
@@ -803,7 +853,7 @@ class SVGPathFixerGUI:
 
                 # Step 1
                 cmds, micro_joined = join_by_threshold(cmds, threshold)
-                self._log_safe(f"  Micro-gaps joined (dist <= {threshold}): {micro_joined}")
+                self._log_safe(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
                 remaining = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
                 self._log_safe(f"  Remaining separate subpaths: {remaining}")
 
