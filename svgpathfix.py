@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 # Ensure fix_path.py can be imported from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from fix_path import (
+from svgpathfix_cli import (
     parse_commands, get_endpoint, dist, cmds_to_str,
     join_by_threshold, trace_graph, deduplicate_endpoints,
     simplify_short_runs, close_subpaths, split_into_subpaths,

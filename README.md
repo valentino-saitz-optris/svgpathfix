@@ -51,10 +51,10 @@ Without `matplotlib`, the GUI falls back to a text-based analysis panel. Without
 
 ```bash
 # Launch with welcome screen
-python fix_path_gui.py
+python svgpathfix.py
 
 # Open a file directly
-python fix_path_gui.py drawing.svg
+python svgpathfix.py drawing.svg
 ```
 
 **Workflow:**
@@ -77,7 +77,7 @@ At high zoom levels, individual path vertices become visible along with start (g
 ### CLI
 
 ```bash
-python fix_path.py [input.svg] [output.svg] [threshold] [--simplify N]
+python svgpathfix_cli.py [input.svg] [output.svg] [threshold] [--simplify N]
 ```
 
 | Argument | Default | Description |
@@ -91,13 +91,13 @@ python fix_path.py [input.svg] [output.svg] [threshold] [--simplify N]
 
 ```bash
 # Basic usage with defaults
-python fix_path.py drawing.svg
+python svgpathfix_cli.py drawing.svg
 
 # Custom output and threshold
-python fix_path.py drawing.svg fixed.svg 0.3
+python svgpathfix_cli.py drawing.svg fixed.svg 0.3
 
 # With segment simplification
-python fix_path.py drawing.svg fixed.svg 0.5 --simplify 0.2
+python svgpathfix_cli.py drawing.svg fixed.svg 0.5 --simplify 0.2
 ```
 
 ## How It Works
@@ -140,8 +140,8 @@ The auto-analysis finds these values by looking for natural gaps in the distance
 
 | File | Description |
 |---|---|
-| `fix_path.py` | Core engine — SVG parser, 5-step pipeline, CLI interface |
-| `fix_path_gui.py` | Tkinter GUI — auto-analysis, interactive charts, real-time preview |
+| `svgpathfix.py` | Tkinter GUI — auto-analysis, interactive charts, real-time preview |
+| `svgpathfix_cli.py` | Core engine — SVG parser, 5-step pipeline, CLI interface |
 
 ## License
 
