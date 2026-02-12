@@ -6,7 +6,7 @@ CAD tools, vector editors, and PDF-to-SVG converters often export SVG `<path>` e
 
 **svgpathfix** analyzes the geometry, recommends optimal parameters, and repairs the paths automatically.
 
-| Before (1599 fragmented paths) | After (2 continuous paths) |
+| Before (1599 fragmented paths) | After (1 continuous path) |
 |:---:|:---:|
 | ![Before](screenshots/problem.png) | ![After](screenshots/analysis-zoom.png) |
 
