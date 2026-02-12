@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.svg
+.claude/
 analyze_*.py
 check_*.py
 compare_*.py
