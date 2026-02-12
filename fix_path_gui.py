@@ -13,7 +13,7 @@ import queue
 import sys
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from tkinter import ttk, filedialog, messagebox
 import xml.etree.ElementTree as ET
 
 # Ensure fix_path.py can be imported from same directory
@@ -55,6 +55,20 @@ PREVIEW_COLORS = [
     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
 ]
+
+# Modern UI theme constants
+BG_MAIN = '#F0F2F5'
+BG_TOOLBAR = '#2C3E50'
+FG_TOOLBAR = '#ECF0F1'
+ACCENT = '#3498DB'
+BG_STATUS = '#34495E'
+FG_STATUS = '#BDC3C7'
+FG_WELCOME = '#7F8C8D'
+FONT_MAIN = ('Segoe UI', 10)
+FONT_MONO = ('Consolas', 9)
+FONT_SMALL = ('Segoe UI', 8)
+FONT_WELCOME_LARGE = ('Segoe UI', 22)
+FONT_WELCOME_SUB = ('Segoe UI', 11)
 
 
 # ── Preview subprocess helpers ────────────────────────────────────────
@@ -195,27 +209,30 @@ def _process_cmds(group_cmds_list, threshold, simplify, graph_tol):
 
 
 def _preview_worker(in_q, out_q):
-    """Long-lived worker process for preview pipeline."""
+    """Long-lived worker thread for preview pipeline.
+
+    Blocks until a request arrives, then drains the queue to skip to the
+    latest request before processing. Only the most recent request is processed.
+    """
     while True:
         msg = in_q.get()
         if msg is None:
             break
-        # Drain to latest request
-        latest = msg
+        # Drain to latest — discard everything except the newest
         while True:
             try:
-                latest = in_q.get_nowait()
-                if latest is None:
+                newer = in_q.get_nowait()
+                if newer is None:
                     return
+                msg = newer
             except Exception:
                 break
-
-        request_id, group_cmds_list, threshold, simplify, graph_tol = latest
+        group_cmds_list, threshold, simplify, graph_tol = msg
         try:
             result = _process_cmds(group_cmds_list, threshold, simplify, graph_tol)
-            out_q.put((request_id, result))
+            out_q.put(result)
         except Exception:
-            pass  # silently skip errors in preview
+            pass
 
 
 # ── Auto-analysis functions ───────────────────────────────────────────
@@ -501,7 +518,6 @@ class SVGPathFixerGUI:
 
         # Preview state
         self._raw_group_cmds = None   # list of cmd lists per group (set on analysis)
-        self._preview_request_id = 0
         self._preview_last_params = None
         self._preview_poll_id = None
         self._preview_pts = None      # list of [(x,y)...] per subpath
@@ -511,14 +527,14 @@ class SVGPathFixerGUI:
         self._view_pan_y = 0.0
         self._drag_start = None
         self._drag_pan_start = None
-        self._preview_in_q = multiprocessing.Queue()
-        self._preview_out_q = multiprocessing.Queue()
-        self._preview_process = multiprocessing.Process(
+        self._preview_in_q = queue.Queue()
+        self._preview_out_q = queue.Queue()
+        self._preview_thread = threading.Thread(
             target=_preview_worker,
             args=(self._preview_in_q, self._preview_out_q),
             daemon=True,
         )
-        self._preview_process.start()
+        self._preview_thread.start()
 
         self.setup_ui()
 
@@ -551,36 +567,81 @@ class SVGPathFixerGUI:
 
     # ── UI setup ──────────────────────────────────────────────────
 
+    def _setup_style(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure('.', background=BG_MAIN, font=FONT_MAIN)
+        style.configure('Toolbar.TFrame', background=BG_TOOLBAR)
+        style.configure('Toolbar.TLabel', background=BG_TOOLBAR,
+                        foreground=FG_TOOLBAR, font=FONT_MAIN)
+        style.configure('Toolbar.TButton', font=FONT_MAIN, padding=(10, 4))
+        style.configure('TLabelframe', background=BG_MAIN)
+        style.configure('TLabelframe.Label', background=BG_MAIN,
+                        font=('Segoe UI', 9, 'bold'))
+        style.configure('Status.TFrame', background=BG_STATUS)
+        style.configure('Status.TLabel', background=BG_STATUS,
+                        foreground=FG_STATUS, font=FONT_MONO)
+        self.root.configure(bg=BG_MAIN)
+
     def setup_ui(self):
+        self._setup_style()
         pad = {'padx': 8, 'pady': 4}
 
-        # -- Input frame --
-        inp = ttk.LabelFrame(self.root, text="Input", padding=6)
-        inp.pack(fill='x', **pad)
+        self._build_toolbar()
+        self._build_status_bar()
 
-        self.file_label = ttk.Label(inp, text="No file loaded", foreground='gray')
+        # Main content: charts left, preview right
+        self.main_paned = ttk.PanedWindow(self.root, orient='horizontal')
+        self.main_paned.pack(fill='both', expand=True, **pad)
+
+        if MPL_AVAILABLE:
+            self._setup_charts_panel()
+        else:
+            self._setup_text_analysis_panel()
+
+        self._build_preview_panel()
+        self._build_welcome_overlay()
+
+    def _build_toolbar(self):
+        toolbar = ttk.Frame(self.root, style='Toolbar.TFrame')
+        toolbar.pack(fill='x')
+
+        inner = ttk.Frame(toolbar, style='Toolbar.TFrame')
+        inner.pack(fill='x', padx=8, pady=6)
+
+        self.file_label = ttk.Label(inner, text="No file loaded",
+                                    style='Toolbar.TLabel')
         self.file_label.pack(side='left', fill='x', expand=True)
 
-        browse_btn = ttk.Button(inp, text="Browse\u2026", command=self.on_browse)
+        self.save_btn = ttk.Button(inner, text="Save As\u2026",
+                                   command=self.on_save,
+                                   style='Toolbar.TButton')
+        self.save_btn.pack(side='right', padx=(6, 0))
+        self.save_btn.state(['disabled'])
+
+        browse_btn = ttk.Button(inner, text="Browse\u2026",
+                                command=self.on_browse,
+                                style='Toolbar.TButton')
         browse_btn.pack(side='right')
 
         if DND_AVAILABLE:
-            self.file_label.configure(text="Drop SVG here or click Browse\u2026")
             self.root.drop_target_register(DND_FILES)
             self.root.dnd_bind('<<Drop>>', self.on_drop)
 
-        # -- Charts / Analysis frame --
-        if MPL_AVAILABLE:
-            self._setup_charts_frame(pad)
-        else:
-            self._setup_text_analysis_frame(pad)
+    def _build_status_bar(self):
+        status_frame = ttk.Frame(self.root, style='Status.TFrame')
+        status_frame.pack(fill='x', side='bottom')
 
-        # -- Preview + Log paned area --
-        paned = ttk.PanedWindow(self.root, orient='horizontal')
-        paned.pack(fill='both', expand=True, **pad)
+        self.status_label = ttk.Label(status_frame, text="Ready",
+                                      style='Status.TLabel')
+        self.status_label.pack(side='left', padx=8, pady=3)
 
-        # Preview canvas (left)
-        preview_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
+        self.status_detail = ttk.Label(status_frame, text="",
+                                       style='Status.TLabel')
+        self.status_detail.pack(side='right', padx=8, pady=3)
+
+    def _build_preview_panel(self):
+        preview_frame = ttk.LabelFrame(self.main_paned, text="Preview", padding=4)
         self.preview_canvas = tk.Canvas(preview_frame, bg='white',
                                          highlightthickness=0)
         self.preview_canvas.pack(fill='both', expand=True)
@@ -590,111 +651,115 @@ class SVGPathFixerGUI:
         self.preview_canvas.bind('<ButtonPress-1>', self._on_preview_drag_start)
         self.preview_canvas.bind('<B1-Motion>', self._on_preview_drag)
         self.preview_canvas.bind('<Double-Button-1>', self._on_preview_reset)
-        paned.add(preview_frame, weight=3)
+        self.main_paned.add(preview_frame, weight=3)
 
-        # Log (right)
-        log_frame = ttk.LabelFrame(paned, text="Log", padding=4)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap='word',
-                                                   state='disabled', font=('Consolas', 9))
-        self.log_text.pack(fill='both', expand=True)
-        paned.add(log_frame, weight=1)
+    def _build_welcome_overlay(self):
+        self.welcome_frame = tk.Frame(self.root, bg=BG_MAIN)
+        self.welcome_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
 
-    def _setup_charts_frame(self, pad):
-        """Create the matplotlib charts frame with 3 charts, sliders, and buttons."""
-        charts = ttk.LabelFrame(self.root, text="Distribution Analysis", padding=6)
-        charts.pack(fill='x', **pad)
+        center = tk.Frame(self.welcome_frame, bg=BG_MAIN)
+        center.place(relx=0.5, rely=0.45, anchor='center')
 
-        # Matplotlib figure with three side-by-side axes
-        self.fig = Figure(figsize=(14, 3.0), dpi=96)
-        self.ax_gap = self.fig.add_subplot(1, 3, 1)
-        self.ax_seg = self.fig.add_subplot(1, 3, 2)
-        self.ax_tol = self.fig.add_subplot(1, 3, 3)
-        self.fig.subplots_adjust(left=0.05, right=0.98, bottom=0.18, top=0.88, wspace=0.28)
+        icon_label = tk.Label(center, text='\u2B07', font=('Segoe UI', 48),
+                              fg=ACCENT, bg=BG_MAIN)
+        icon_label.pack(pady=(0, 12))
 
-        # Initial placeholder text
-        for ax, label in [(self.ax_gap, 'gap distribution'),
-                          (self.ax_seg, 'segment distribution'),
-                          (self.ax_tol, 'endpoint distances')]:
-            ax.text(0.5, 0.5, f'Load an SVG to see\n{label}',
-                    transform=ax.transAxes, ha='center', va='center',
-                    fontsize=10, color='gray')
-            ax.set_xticks([])
-            ax.set_yticks([])
+        main_text = tk.Label(center, text='Drop SVG file here',
+                             font=FONT_WELCOME_LARGE, fg='#2C3E50', bg=BG_MAIN)
+        main_text.pack()
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=charts)
-        self.canvas.get_tk_widget().pack(fill='x')
-        self.canvas.draw()
+        sub_text = tk.Label(center,
+                            text='or click anywhere to browse',
+                            font=FONT_WELCOME_SUB, fg=FG_WELCOME, bg=BG_MAIN)
+        sub_text.pack(pady=(6, 20))
 
-        # Slider frame — three columns
-        slider_frame = ttk.Frame(charts)
-        slider_frame.pack(fill='x', pady=(2, 0))
+        welcome_browse = ttk.Button(center, text='Open SVG File\u2026',
+                                    command=self.on_browse,
+                                    style='Toolbar.TButton')
+        welcome_browse.pack(ipadx=16, ipady=4)
 
-        # Gap slider
-        gap_sf = ttk.Frame(slider_frame)
-        gap_sf.pack(side='left', fill='x', expand=True, padx=(0, 6))
-        ttk.Label(gap_sf, text="Threshold:", font=('', 8)).pack(side='left')
-        self.gap_slider = tk.Scale(gap_sf, from_=0, to=SLIDER_STEPS,
-                                    orient='horizontal', showvalue=False,
-                                    command=self._on_gap_slider_move)
-        self.gap_slider.pack(side='left', fill='x', expand=True)
-        self.gap_slider_label = ttk.Label(gap_sf, text="--", width=10,
-                                           font=('Consolas', 8))
-        self.gap_slider_label.pack(side='left', padx=(4, 0))
+        if not DND_AVAILABLE:
+            hint = tk.Label(center,
+                            text='(Drag-and-drop not available \u2014 use button above)',
+                            font=FONT_SMALL, fg='#BDC3C7', bg=BG_MAIN)
+            hint.pack(pady=(12, 0))
 
-        # Segment slider
-        seg_sf = ttk.Frame(slider_frame)
-        seg_sf.pack(side='left', fill='x', expand=True, padx=(6, 6))
-        ttk.Label(seg_sf, text="Simplify:", font=('', 8)).pack(side='left')
-        self.seg_slider = tk.Scale(seg_sf, from_=0, to=SLIDER_STEPS,
-                                    orient='horizontal', showvalue=False,
-                                    command=self._on_seg_slider_move)
-        self.seg_slider.pack(side='left', fill='x', expand=True)
-        self.seg_slider_label = ttk.Label(seg_sf, text="--", width=10,
-                                           font=('Consolas', 8))
-        self.seg_slider_label.pack(side='left', padx=(4, 0))
+        for widget in [self.welcome_frame, center, icon_label, main_text, sub_text]:
+            widget.bind('<Button-1>', lambda e: self.on_browse())
 
-        # Tolerance slider
-        tol_sf = ttk.Frame(slider_frame)
-        tol_sf.pack(side='left', fill='x', expand=True, padx=(6, 0))
-        ttk.Label(tol_sf, text="Tolerance:", font=('', 8)).pack(side='left')
-        self.tol_slider = tk.Scale(tol_sf, from_=0, to=SLIDER_STEPS,
-                                    orient='horizontal', showvalue=False,
-                                    command=self._on_tol_slider_move)
-        self.tol_slider.pack(side='left', fill='x', expand=True)
-        self.tol_slider_label = ttk.Label(tol_sf, text="--", width=10,
-                                           font=('Consolas', 8))
-        self.tol_slider_label.pack(side='left', padx=(4, 0))
+    def _dismiss_welcome(self):
+        if hasattr(self, 'welcome_frame') and self.welcome_frame.winfo_exists():
+            self.welcome_frame.place_forget()
+            self.welcome_frame.destroy()
 
-        # Options + buttons row
-        bottom_frame = ttk.Frame(charts)
-        bottom_frame.pack(fill='x', pady=(6, 0))
+    def _make_chart_block(self, parent, placeholder, slider_label, slider_cmd):
+        """Create one chart + slider pair. Returns (fig, ax, slider, slider_label_widget)."""
+        fig = Figure(figsize=(4, 2.2), dpi=96)
+        ax = fig.add_subplot(1, 1, 1)
+        fig.subplots_adjust(left=0.15, right=0.95, bottom=0.22, top=0.88)
+        ax.text(0.5, 0.5, f'Load an SVG to see\n{placeholder}',
+                transform=ax.transAxes, ha='center', va='center',
+                fontsize=9, color='gray')
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-        # Enable simplify checkbox
+        mpl_canvas = FigureCanvasTkAgg(fig, master=parent)
+        mpl_canvas.get_tk_widget().pack(fill='both', expand=True)
+        mpl_canvas.draw()
+
+        sf = ttk.Frame(parent)
+        sf.pack(fill='x', pady=(0, 4))
+        ttk.Label(sf, text=slider_label, font=FONT_SMALL, width=10).pack(side='left')
+        slider = tk.Scale(sf, from_=0, to=SLIDER_STEPS,
+                          orient='horizontal', showvalue=False,
+                          command=slider_cmd)
+        slider.pack(side='left', fill='x', expand=True)
+        val_label = ttk.Label(sf, text="--", width=10, font=FONT_SMALL)
+        val_label.pack(side='left', padx=(4, 0))
+
+        return fig, ax, slider, val_label
+
+    def _setup_charts_panel(self):
+        """Create the left panel with 3 vertically stacked charts, each with its slider."""
+        panel = ttk.LabelFrame(self.main_paned, text="Distribution Analysis",
+                               padding=6)
+
+        # Gap chart + slider
+        self.fig_gap, self.ax_gap, self.gap_slider, self.gap_slider_label = \
+            self._make_chart_block(panel, 'gap distribution',
+                                   'Threshold:', self._on_gap_slider_move)
+
+        # Segment chart + slider + enable checkbox
+        self.fig_seg, self.ax_seg, self.seg_slider, self.seg_slider_label = \
+            self._make_chart_block(panel, 'segment distribution',
+                                   'Simplify:', self._on_seg_slider_move)
+        # Insert enable checkbox after the segment slider
         self.enable_simplify_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bottom_frame, text="Enable simplify",
+        ttk.Checkbutton(panel, text="Enable simplify",
                          variable=self.enable_simplify_var,
-                         command=self._on_enable_simplify_toggle).pack(side='left')
+                         command=self._on_enable_simplify_toggle).pack(anchor='w')
 
-        # Summary label
-        self.summary_label = ttk.Label(bottom_frame, text="Load an SVG to begin analysis",
-                                        foreground='gray', font=('Consolas', 9))
-        self.summary_label.pack(side='left', padx=(16, 16), fill='x', expand=True)
+        # Endpoint chart + slider
+        self.fig_tol, self.ax_tol, self.tol_slider, self.tol_slider_label = \
+            self._make_chart_block(panel, 'endpoint distances',
+                                   'Tolerance:', self._on_tol_slider_move)
 
-        # Buttons
-        self.save_btn = ttk.Button(bottom_frame, text="Save As\u2026", command=self.on_save)
-        self.save_btn.pack(side='right')
-        self.save_btn.state(['disabled'])
+        # Summary label at bottom
+        self.summary_label = ttk.Label(panel, text="Load an SVG to begin analysis",
+                                        foreground='gray', font=FONT_MONO,
+                                        wraplength=350)
+        self.summary_label.pack(fill='x', pady=(4, 0))
 
-    def _setup_text_analysis_frame(self, pad):
-        """Fallback: plain text analysis when matplotlib is not available."""
-        ana = ttk.LabelFrame(self.root, text="Auto-Analysis", padding=6)
-        ana.pack(fill='x', **pad)
+        self.main_paned.add(panel, weight=1)
 
-        self.analysis_text = tk.Text(ana, height=6, wrap='word', state='disabled',
-                                     bg='#f5f5f5', relief='flat', font=('Consolas', 9))
-        self.analysis_text.pack(fill='x')
+    def _setup_text_analysis_panel(self):
+        """Fallback left panel when matplotlib is not available."""
+        ana = ttk.LabelFrame(self.main_paned, text="Auto-Analysis", padding=6)
 
-        # Enable simplify + buttons for text fallback
+        self.analysis_text = tk.Text(ana, height=12, wrap='word', state='disabled',
+                                     bg='#f5f5f5', relief='flat', font=FONT_MONO)
+        self.analysis_text.pack(fill='both', expand=True)
+
         btn_frame = ttk.Frame(ana)
         btn_frame.pack(fill='x', pady=(6, 0))
 
@@ -702,9 +767,7 @@ class SVGPathFixerGUI:
         ttk.Checkbutton(btn_frame, text="Enable simplify",
                          variable=self.enable_simplify_var).pack(side='left')
 
-        self.save_btn = ttk.Button(btn_frame, text="Save As\u2026", command=self.on_save)
-        self.save_btn.pack(side='right')
-        self.save_btn.state(['disabled'])
+        self.main_paned.add(ana, weight=1)
 
     # ── Histogram drawing ────────────────────────────────────────
 
@@ -759,7 +822,7 @@ class SVGPathFixerGUI:
         above = len(data) - below
         left_txt.set_text(f'{below} {left_label}')
         right_txt.set_text(f'{above} {right_label}')
-        self.canvas.draw_idle()
+        vline.figure.canvas.draw_idle()
 
     # ── Slider callbacks ─────────────────────────────────────────
 
@@ -817,7 +880,7 @@ class SVGPathFixerGUI:
                 self.seg_left_txt.set_alpha(alpha)
             if self.seg_right_txt:
                 self.seg_right_txt.set_alpha(alpha)
-            self.canvas.draw_idle()
+            self.ax_seg.figure.canvas.draw_idle()
 
         if enabled:
             self.seg_slider.configure(state='normal')
@@ -829,7 +892,11 @@ class SVGPathFixerGUI:
     # ── Preview ──────────────────────────────────────────────────
 
     def _submit_preview(self):
-        """Submit a preview request if parameters changed."""
+        """Submit a preview request if parameters changed.
+
+        Drains the input queue first so at most one pending request waits
+        behind whatever the worker is currently processing.
+        """
         if self._raw_group_cmds is None:
             return
         simplify = self.simplify if self.enable_simplify_var.get() else None
@@ -837,9 +904,13 @@ class SVGPathFixerGUI:
         if params == self._preview_last_params:
             return
         self._preview_last_params = params
-        self._preview_request_id += 1
+        # Drain any stale pending request so only the latest waits
+        try:
+            while True:
+                self._preview_in_q.get_nowait()
+        except Exception:
+            pass
         self._preview_in_q.put((
-            self._preview_request_id,
             self._raw_group_cmds,
             self.threshold,
             simplify,
@@ -847,19 +918,19 @@ class SVGPathFixerGUI:
         ))
 
     def _poll_preview(self):
-        """Poll the subprocess output queue for completed preview results."""
+        """Poll the output queue for completed preview results."""
+        latest = None
         try:
             while True:
-                request_id, subpaths = self._preview_out_q.get_nowait()
-                if request_id == self._preview_request_id:
-                    self._render_preview(subpaths)
+                latest = self._preview_out_q.get_nowait()
         except queue.Empty:
             pass
+        if latest is not None:
+            self._render_preview(latest)
         self._preview_poll_id = self.root.after(50, self._poll_preview)
 
     def _render_preview(self, subpaths):
         """Store processed subpath data and redraw the preview canvas."""
-        # Flatten all subpaths to point lists
         all_pts = [_flatten_subpath(sp) for sp in subpaths]
         all_pts = [pts for pts in all_pts if len(pts) >= 2]
         self._preview_pts = all_pts
@@ -985,28 +1056,24 @@ class SVGPathFixerGUI:
         self._redraw_preview()
 
     def _on_close(self):
-        """Clean shutdown: stop preview subprocess, destroy window."""
+        """Clean shutdown: stop preview thread, destroy window."""
         if self._preview_poll_id is not None:
             self.root.after_cancel(self._preview_poll_id)
         try:
             self._preview_in_q.put(None)
-            self._preview_process.join(timeout=2)
+            self._preview_thread.join(timeout=2)
         except Exception:
             pass
         self.root.destroy()
 
-    # ── Logging ───────────────────────────────────────────────────
+    # ── Status bar ─────────────────────────────────────────────────
 
-    def log(self, msg):
-        self.log_text.configure(state='normal')
-        self.log_text.insert('end', msg + '\n')
-        self.log_text.see('end')
-        self.log_text.configure(state='disabled')
+    def _set_status(self, msg, detail=''):
+        self.status_label.configure(text=msg)
+        self.status_detail.configure(text=detail)
 
-    def clear_log(self):
-        self.log_text.configure(state='normal')
-        self.log_text.delete('1.0', 'end')
-        self.log_text.configure(state='disabled')
+    def _set_status_safe(self, msg, detail=''):
+        self.root.after(0, self._set_status, msg, detail)
 
     def _set_analysis_text(self, text):
         """Set text in the fallback analysis widget (no matplotlib)."""
@@ -1037,12 +1104,12 @@ class SVGPathFixerGUI:
             messagebox.showwarning("Invalid file", "Please drop an SVG file.")
 
     def load_file(self, path):
+        self._dismiss_welcome()
         self.current_file = path
         self.save_btn.state(['disabled'])
         name = os.path.basename(path)
-        self.file_label.configure(text=name, foreground='black')
-        self.clear_log()
-        self.log(f"Loaded: {path}")
+        self.file_label.configure(text=name)
+        self._set_status(f"Analyzing {name}...")
 
         if MPL_AVAILABLE:
             self.summary_label.configure(text="Analyzing...", foreground='gray')
@@ -1064,7 +1131,7 @@ class SVGPathFixerGUI:
             self.summary_label.configure(text=f"Error: {err}", foreground='red')
         else:
             self._set_analysis_text(f"Error: {err}")
-        self.log(f"Analysis error: {err}")
+        self._set_status(f"Error: {err}")
 
     def _on_analysis_done(self, result):
         if 'error' in result:
@@ -1087,7 +1154,7 @@ class SVGPathFixerGUI:
         else:
             self._on_analysis_done_text(result)
 
-        self.log("Analysis complete.")
+        self._set_status("Analysis complete", "Ready to save")
 
         # Trigger initial preview with recommended values
         self._preview_last_params = None  # force submit
@@ -1173,7 +1240,8 @@ class SVGPathFixerGUI:
         else:
             self._show_placeholder(self.ax_tol, 'No endpoint data')
 
-        self.canvas.draw()
+        for fig in (self.fig_gap, self.fig_seg, self.fig_tol):
+            fig.canvas.draw()
 
     def _show_placeholder(self, ax, message):
         """Show placeholder text in an empty chart."""
@@ -1228,8 +1296,6 @@ class SVGPathFixerGUI:
 
         self._set_analysis_text('\n'.join(lines))
 
-    # ── Processing ────────────────────────────────────────────────
-
     # ── Save ──────────────────────────────────────────────────────
 
     def on_save(self):
@@ -1254,8 +1320,7 @@ class SVGPathFixerGUI:
         graph_tol = self.graph_tol
 
         self.save_btn.state(['disabled'])
-        self.log(f"\nSaving with threshold={threshold:.6g}, "
-                 f"simplify={simplify}, graph_tol={graph_tol:.6g}")
+        self._set_status("Saving...", f"threshold={threshold:.4g}")
 
         t = threading.Thread(
             target=self._run_save,
@@ -1266,7 +1331,6 @@ class SVGPathFixerGUI:
 
     def _run_save(self, save_path, threshold, simplify, graph_tol):
         try:
-            # Re-parse the original file so the analysis tree stays pristine
             ET.register_namespace('', 'http://www.w3.org/2000/svg')
             tree = ET.parse(self.current_file)
             root = tree.getroot()
@@ -1280,37 +1344,37 @@ class SVGPathFixerGUI:
 
             for gi, (attrs, cmds, elements) in enumerate(groups):
                 total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"\nGroup #{gi + 1} ({len(elements)} paths merged, "
-                               f"{len(cmds)} commands, {total_m + 1} subpaths):")
+                print(f"Group #{gi + 1} ({len(elements)} paths merged, "
+                      f"{len(cmds)} commands, {total_m + 1} subpaths):")
 
                 cmds, micro_joined = join_by_threshold(cmds, threshold)
-                self._log_safe(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
+                print(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
                 remaining = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Remaining separate subpaths: {remaining + 1}")
+                print(f"  Remaining separate subpaths: {remaining + 1}")
 
                 cmds, traced = trace_graph(cmds, tol=graph_tol)
                 remaining2 = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Graph-traced: {traced} merged "
-                               f"({remaining + 1} -> {remaining2 + 1} subpaths)")
+                print(f"  Graph-traced: {traced} merged "
+                      f"({remaining + 1} -> {remaining2 + 1} subpaths)")
 
                 before3 = len(cmds)
                 cmds, deduped = deduplicate_endpoints(cmds)
                 if deduped:
-                    self._log_safe(f"  Near-duplicate endpoints removed: {deduped} "
-                                   f"({before3} -> {len(cmds)} commands)")
+                    print(f"  Near-duplicate endpoints removed: {deduped} "
+                          f"({before3} -> {len(cmds)} commands)")
 
                 if simplify is not None and simplify > 0:
                     before = len(cmds)
                     cmds, removed = simplify_short_runs(cmds, simplify)
-                    self._log_safe(f"  Simplified: {removed} segments removed "
-                                   f"({before} -> {len(cmds)} commands)")
+                    print(f"  Simplified: {removed} segments removed "
+                          f"({before} -> {len(cmds)} commands)")
 
                 cmds, closed_count = close_subpaths(cmds)
                 if closed_count:
-                    self._log_safe(f"  Subpaths closed (start~=end): {closed_count}")
+                    print(f"  Subpaths closed (start~=end): {closed_count}")
 
                 result_subpaths = split_into_subpaths(cmds)
-                self._log_safe(f"  Output: {len(result_subpaths)} continuous path(s)")
+                print(f"  Output: {len(result_subpaths)} continuous path(s)")
                 total_output_paths += len(result_subpaths)
 
                 insert_parent = parent_map[elements[0]]
@@ -1325,15 +1389,15 @@ class SVGPathFixerGUI:
                         new_el.set(k, v)
 
             tree.write(save_path, xml_declaration=False, encoding='unicode')
-            self._log_safe(f"\nSaved {total_output_paths} path(s) to: {save_path}")
+            print(f"Saved {total_output_paths} path(s) to: {save_path}")
+            self._set_status_safe(
+                f"Saved {total_output_paths} path(s)",
+                os.path.basename(save_path))
             self.root.after(0, lambda: self.save_btn.state(['!disabled']))
         except Exception as e:
-            self._log_safe(f"Save error: {e}")
+            print(f"Save error: {e}")
+            self._set_status_safe(f"Save error: {e}")
             self.root.after(0, lambda: self.save_btn.state(['!disabled']))
-
-    def _log_safe(self, msg):
-        """Thread-safe logging."""
-        self.root.after(0, self.log, msg)
 
 
 # ── Entry point ───────────────────────────────────────────────────────
