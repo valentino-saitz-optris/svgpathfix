@@ -7,7 +7,9 @@ Displays interactive histograms with log-scale sliders for picking values.
 """
 
 import math
+import multiprocessing
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -48,6 +50,172 @@ SLIDER_STEPS = 1000
 COLOR_BELOW = '#4A90D9'
 COLOR_ABOVE = '#E8913A'
 COLOR_LINE = '#D32F2F'
+
+PREVIEW_COLORS = [
+    '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+    '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+]
+
+
+# ── Preview subprocess helpers ────────────────────────────────────────
+
+def _cubic_bezier_points(x0, y0, x1, y1, x2, y2, x3, y3, n=8):
+    """Approximate a cubic bezier with n line segments via De Casteljau."""
+    pts = []
+    for i in range(n + 1):
+        t = i / n
+        u = 1 - t
+        x = u*u*u*x0 + 3*u*u*t*x1 + 3*u*t*t*x2 + t*t*t*x3
+        y = u*u*u*y0 + 3*u*u*t*y1 + 3*u*t*t*y2 + t*t*t*y3
+        pts.append((x, y))
+    return pts
+
+
+def _flatten_subpath(cmds):
+    """Convert a subpath's commands into a list of (x, y) points for drawing."""
+    pts = []
+    cx, cy = 0.0, 0.0
+    sx, sy = 0.0, 0.0  # subpath start
+
+    for cmd, args in cmds:
+        if cmd == 'M':
+            cx, cy = args[0], args[1]
+            sx, sy = cx, cy
+            pts.append((cx, cy))
+        elif cmd == 'm':
+            cx, cy = cx + args[0], cy + args[1]
+            sx, sy = cx, cy
+            pts.append((cx, cy))
+        elif cmd == 'L':
+            cx, cy = args[0], args[1]
+            pts.append((cx, cy))
+        elif cmd == 'l':
+            cx, cy = cx + args[0], cy + args[1]
+            pts.append((cx, cy))
+        elif cmd == 'H':
+            cx = args[0]
+            pts.append((cx, cy))
+        elif cmd == 'h':
+            cx = cx + args[0]
+            pts.append((cx, cy))
+        elif cmd == 'V':
+            cy = args[0]
+            pts.append((cx, cy))
+        elif cmd == 'v':
+            cy = cy + args[0]
+            pts.append((cx, cy))
+        elif cmd == 'C':
+            bezier = _cubic_bezier_points(
+                cx, cy, args[0], args[1], args[2], args[3], args[4], args[5])
+            pts.extend(bezier[1:])  # skip first (=current pos)
+            cx, cy = args[4], args[5]
+        elif cmd == 'c':
+            bezier = _cubic_bezier_points(
+                cx, cy, cx+args[0], cy+args[1],
+                cx+args[2], cy+args[3], cx+args[4], cy+args[5])
+            pts.extend(bezier[1:])
+            cx, cy = cx + args[4], cy + args[5]
+        elif cmd == 'S':
+            # Smooth cubic — use endpoint as control point (simplified)
+            bezier = _cubic_bezier_points(
+                cx, cy, cx, cy, args[0], args[1], args[2], args[3])
+            pts.extend(bezier[1:])
+            cx, cy = args[2], args[3]
+        elif cmd == 's':
+            bezier = _cubic_bezier_points(
+                cx, cy, cx, cy, cx+args[0], cy+args[1], cx+args[2], cy+args[3])
+            pts.extend(bezier[1:])
+            cx, cy = cx + args[2], cy + args[3]
+        elif cmd == 'Q':
+            # Quadratic → approximate as cubic
+            qx1, qy1, qx2, qy2 = args[0], args[1], args[2], args[3]
+            cx1 = cx + 2/3 * (qx1 - cx)
+            cy1 = cy + 2/3 * (qy1 - cy)
+            cx2 = qx2 + 2/3 * (qx1 - qx2)
+            cy2 = qy2 + 2/3 * (qy1 - qy2)
+            bezier = _cubic_bezier_points(cx, cy, cx1, cy1, cx2, cy2, qx2, qy2)
+            pts.extend(bezier[1:])
+            cx, cy = qx2, qy2
+        elif cmd == 'q':
+            qx1, qy1, qx2, qy2 = cx+args[0], cy+args[1], cx+args[2], cy+args[3]
+            cx1 = cx + 2/3 * (qx1 - cx)
+            cy1 = cy + 2/3 * (qy1 - cy)
+            cx2 = qx2 + 2/3 * (qx1 - qx2)
+            cy2 = qy2 + 2/3 * (qy1 - qy2)
+            bezier = _cubic_bezier_points(cx, cy, cx1, cy1, cx2, cy2, qx2, qy2)
+            pts.extend(bezier[1:])
+            cx, cy = qx2, qy2
+        elif cmd in ('Z', 'z'):
+            if (cx, cy) != (sx, sy):
+                pts.append((sx, sy))
+            cx, cy = sx, sy
+        else:
+            # T, t, A, a — approximate with line to endpoint
+            ex, ey = get_endpoint(cmd, args, cx, cy)
+            pts.append((ex, ey))
+            cx, cy = ex, ey
+
+    return pts
+
+
+def _compute_bounds(subpaths_points):
+    """Compute (min_x, min_y, max_x, max_y) from list of point lists."""
+    min_x = min_y = float('inf')
+    max_x = max_y = float('-inf')
+    for pts in subpaths_points:
+        for x, y in pts:
+            if x < min_x: min_x = x
+            if y < min_y: min_y = y
+            if x > max_x: max_x = x
+            if y > max_y: max_y = y
+    if min_x == float('inf'):
+        return 0, 0, 1, 1
+    # Ensure non-zero dimensions
+    if max_x == min_x: max_x = min_x + 1
+    if max_y == min_y: max_y = min_y + 1
+    return min_x, min_y, max_x, max_y
+
+
+def _process_cmds(group_cmds_list, threshold, simplify, graph_tol):
+    """Run 5-step pipeline on each group's commands. Returns list of subpath cmd lists.
+
+    group_cmds_list: list of cmd lists (one per visual-attribute group).
+    This function runs in the subprocess.
+    """
+    all_subpaths = []
+    for cmds in group_cmds_list:
+        cmds, _ = join_by_threshold(cmds, threshold)
+        cmds, _ = trace_graph(cmds, tol=graph_tol)
+        cmds, _ = deduplicate_endpoints(cmds)
+        if simplify is not None and simplify > 0:
+            cmds, _ = simplify_short_runs(cmds, simplify)
+        cmds, _ = close_subpaths(cmds)
+        all_subpaths.extend(split_into_subpaths(cmds))
+    return all_subpaths
+
+
+def _preview_worker(in_q, out_q):
+    """Long-lived worker process for preview pipeline."""
+    while True:
+        msg = in_q.get()
+        if msg is None:
+            break
+        # Drain to latest request
+        latest = msg
+        while True:
+            try:
+                latest = in_q.get_nowait()
+                if latest is None:
+                    return
+            except Exception:
+                break
+
+        request_id, group_cmds_list, threshold, simplify, graph_tol = latest
+        try:
+            result = _process_cmds(group_cmds_list, threshold, simplify, graph_tol)
+            out_q.put((request_id, result))
+        except Exception:
+            pass  # silently skip errors in preview
 
 
 # ── Auto-analysis functions ───────────────────────────────────────────
@@ -209,6 +377,26 @@ def analyze_endpoint_distribution(cmds):
     }
 
 
+def _group_paths(paths):
+    """Group path elements by visual attributes (everything except 'd').
+
+    Returns list of (attrs_dict, combined_cmds, path_elements).
+    Paths with identical non-d attributes are merged into one command list.
+    """
+    groups = {}  # key -> (attrs_dict, [cmds...], [elements...])
+    for p in paths:
+        attrs = dict(p.attrib)
+        d = attrs.pop('d', '')
+        if not d:
+            continue
+        key = tuple(sorted(attrs.items()))
+        if key not in groups:
+            groups[key] = (attrs, [], [])
+        groups[key][1].extend(parse_commands(d))
+        groups[key][2].append(p)
+    return list(groups.values())
+
+
 def auto_analyze_svg(svg_path):
     """Full auto-analysis on an SVG file. Returns analysis dict."""
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
@@ -222,12 +410,16 @@ def auto_analyze_svg(svg_path):
     if not paths:
         return {'error': 'No <path> elements found in SVG.'}
 
-    d = paths[0].get('d', '')
-    if not d:
-        return {'error': 'First <path> has no d attribute.'}
+    # Group paths by visual attributes and merge commands within each group
+    groups = _group_paths(paths)
+    if not groups:
+        return {'error': 'No <path> elements with d attributes found.'}
 
-    cmds = parse_commands(d)
-    total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
+    # Combine all commands across all groups for analysis
+    cmds = []
+    for _attrs, group_cmds, _elems in groups:
+        cmds.extend(group_cmds)
+
     subpaths = split_into_subpaths(cmds)
 
     gap_analysis = analyze_gap_distribution(cmds)
@@ -240,12 +432,16 @@ def auto_analyze_svg(svg_path):
         joined_cmds = cmds
     endpoint_analysis = analyze_endpoint_distribution(joined_cmds)
 
+    # Extract raw cmd lists per group for preview subprocess
+    group_cmds_list = [group_cmds for _attrs, group_cmds, _elems in groups]
+
     return {
         'tree': tree,
         'path_count': len(paths),
         'command_count': len(cmds),
         'subpath_count': len(subpaths),
-        'm_breaks': total_m,
+        'group_count': len(groups),
+        'group_cmds': group_cmds_list,
         'gap_analysis': gap_analysis,
         'segment_analysis': seg_analysis,
         'endpoint_analysis': endpoint_analysis,
@@ -259,11 +455,11 @@ class SVGPathFixerGUI:
         self.root = root
         self.root.title("SVG Path Fixer")
         if MPL_AVAILABLE:
-            self.root.geometry("1200x780")
-            self.root.minsize(900, 600)
+            self.root.geometry("1200x850")
+            self.root.minsize(900, 650)
         else:
-            self.root.geometry("820x680")
-            self.root.minsize(600, 500)
+            self.root.geometry("820x750")
+            self.root.minsize(600, 550)
 
         self.current_file = None
         self.analysis = None
@@ -305,7 +501,27 @@ class SVGPathFixerGUI:
         self.tol_right_txt = None
         self.tol_bin_centers = None
 
+        # Preview state
+        self._raw_group_cmds = None   # list of cmd lists per group (set on analysis)
+        self._preview_request_id = 0
+        self._preview_last_params = None
+        self._preview_poll_id = None
+        self._preview_in_q = multiprocessing.Queue()
+        self._preview_out_q = multiprocessing.Queue()
+        self._preview_process = multiprocessing.Process(
+            target=_preview_worker,
+            args=(self._preview_in_q, self._preview_out_q),
+            daemon=True,
+        )
+        self._preview_process.start()
+
         self.setup_ui()
+
+        # Start polling for preview results
+        self._poll_preview()
+
+        # Clean shutdown
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ── Log-scale slider helpers ─────────────────────────────────
 
@@ -354,13 +570,23 @@ class SVGPathFixerGUI:
         else:
             self._setup_text_analysis_frame(pad)
 
-        # -- Log frame --
-        log_frame = ttk.LabelFrame(self.root, text="Log", padding=6)
-        log_frame.pack(fill='both', expand=True, **pad)
+        # -- Preview + Log paned area --
+        paned = ttk.PanedWindow(self.root, orient='horizontal')
+        paned.pack(fill='both', expand=True, **pad)
 
+        # Preview canvas (left)
+        preview_frame = ttk.LabelFrame(paned, text="Preview", padding=4)
+        self.preview_canvas = tk.Canvas(preview_frame, bg='white',
+                                         highlightthickness=0)
+        self.preview_canvas.pack(fill='both', expand=True)
+        paned.add(preview_frame, weight=3)
+
+        # Log (right)
+        log_frame = ttk.LabelFrame(paned, text="Log", padding=4)
         self.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap='word',
                                                    state='disabled', font=('Consolas', 9))
         self.log_text.pack(fill='both', expand=True)
+        paned.add(log_frame, weight=1)
 
     def _setup_charts_frame(self, pad):
         """Create the matplotlib charts frame with 3 charts, sliders, and buttons."""
@@ -545,6 +771,7 @@ class SVGPathFixerGUI:
                            self.gap_right_txt, self.gap_bin_centers,
                            self.gap_data, value, 'micro', 'structural')
         self._updating_threshold = False
+        self._submit_preview()
 
     def _on_seg_slider_move(self, pos):
         if self._updating_simplify or self.seg_data is None:
@@ -557,6 +784,7 @@ class SVGPathFixerGUI:
                            self.seg_right_txt, self.seg_bin_centers,
                            self.seg_data, value, 'jitter', 'structural')
         self._updating_simplify = False
+        self._submit_preview()
 
     def _on_tol_slider_move(self, pos):
         if self._updating_tol or self.tol_data is None:
@@ -569,6 +797,7 @@ class SVGPathFixerGUI:
                            self.tol_right_txt, self.tol_bin_centers,
                            self.tol_data, value, 'matched', 'unmatched')
         self._updating_tol = False
+        self._submit_preview()
 
     # ── Enable checkbox callback ─────────────────────────────────
 
@@ -591,6 +820,88 @@ class SVGPathFixerGUI:
             self.seg_slider.configure(state='normal')
         else:
             self.seg_slider.configure(state='disabled')
+
+        self._submit_preview()
+
+    # ── Preview ──────────────────────────────────────────────────
+
+    def _submit_preview(self):
+        """Submit a preview request if parameters changed."""
+        if self._raw_group_cmds is None:
+            return
+        simplify = self.simplify if self.enable_simplify_var.get() else None
+        params = (self.threshold, simplify, self.graph_tol)
+        if params == self._preview_last_params:
+            return
+        self._preview_last_params = params
+        self._preview_request_id += 1
+        self._preview_in_q.put((
+            self._preview_request_id,
+            self._raw_group_cmds,
+            self.threshold,
+            simplify,
+            self.graph_tol,
+        ))
+
+    def _poll_preview(self):
+        """Poll the subprocess output queue for completed preview results."""
+        try:
+            while True:
+                request_id, subpaths = self._preview_out_q.get_nowait()
+                if request_id == self._preview_request_id:
+                    self._render_preview(subpaths)
+        except queue.Empty:
+            pass
+        self._preview_poll_id = self.root.after(50, self._poll_preview)
+
+    def _render_preview(self, subpaths):
+        """Draw processed subpaths on the preview canvas."""
+        c = self.preview_canvas
+        c.delete('all')
+
+        # Flatten all subpaths to point lists
+        all_pts = [_flatten_subpath(sp) for sp in subpaths]
+        # Filter out empty
+        all_pts = [pts for pts in all_pts if len(pts) >= 2]
+        if not all_pts:
+            c.create_text(c.winfo_width() // 2, c.winfo_height() // 2,
+                          text="No paths to display", fill='gray', font=('', 10))
+            return
+
+        bounds = _compute_bounds(all_pts)
+        bx, by, bx2, by2 = bounds
+        bw, bh = bx2 - bx, by2 - by
+
+        cw = max(c.winfo_width(), 100)
+        ch = max(c.winfo_height(), 100)
+        margin = 12
+        scale = min((cw - 2 * margin) / bw, (ch - 2 * margin) / bh)
+        ox = margin + ((cw - 2 * margin) - bw * scale) / 2 - bx * scale
+        oy = margin + ((ch - 2 * margin) - bh * scale) / 2 - by * scale
+
+        for i, pts in enumerate(all_pts):
+            color = PREVIEW_COLORS[i % len(PREVIEW_COLORS)]
+            coords = []
+            for x, y in pts:
+                coords.append(x * scale + ox)
+                coords.append(y * scale + oy)
+            if len(coords) >= 4:
+                c.create_line(*coords, fill=color, width=1)
+
+        # Summary text
+        c.create_text(4, ch - 4, anchor='sw', fill='gray', font=('Consolas', 8),
+                       text=f"{len(all_pts)} paths, {sum(len(p) for p in all_pts)} points")
+
+    def _on_close(self):
+        """Clean shutdown: stop preview subprocess, destroy window."""
+        if self._preview_poll_id is not None:
+            self.root.after_cancel(self._preview_poll_id)
+        try:
+            self._preview_in_q.put(None)
+            self._preview_process.join(timeout=2)
+        except Exception:
+            pass
+        self.root.destroy()
 
     # ── Logging ───────────────────────────────────────────────────
 
@@ -674,12 +985,19 @@ class SVGPathFixerGUI:
         self.analysis = result
         self.process_btn.state(['!disabled'])
 
+        # Store raw commands for preview subprocess
+        self._raw_group_cmds = result.get('group_cmds')
+
         if MPL_AVAILABLE:
             self._on_analysis_done_charts(result)
         else:
             self._on_analysis_done_text(result)
 
         self.log("Analysis complete.")
+
+        # Trigger initial preview with recommended values
+        self._preview_last_params = None  # force submit
+        self._submit_preview()
 
     def _set_slider(self, slider, label, value, slider_range, updating_attr):
         """Helper to set a slider position without triggering callbacks."""
@@ -691,8 +1009,11 @@ class SVGPathFixerGUI:
 
     def _on_analysis_done_charts(self, result):
         """Populate all three charts from analysis results."""
+        pc = result['path_count']
+        gc = result.get('group_count', 1)
+        merged_note = f" ({pc} paths merged)" if pc > 1 else ""
         self.summary_label.configure(
-            text=f"Paths: {result['path_count']}   "
+            text=f"Groups: {gc}{merged_note}   "
                  f"Commands: {result['command_count']}   "
                  f"Subpaths: {result['subpath_count']}",
             foreground='black')
@@ -771,7 +1092,10 @@ class SVGPathFixerGUI:
     def _on_analysis_done_text(self, result):
         """Fallback: populate text widget when matplotlib is unavailable."""
         lines = []
-        lines.append(f"Paths: {result['path_count']}   "
+        pc = result['path_count']
+        gc = result.get('group_count', 1)
+        merged_note = f" ({pc} paths merged)" if pc > 1 else ""
+        lines.append(f"Groups: {gc}{merged_note}   "
                       f"Commands: {result['command_count']}   "
                       f"Subpaths: {result['subpath_count']}")
 
@@ -841,26 +1165,29 @@ class SVGPathFixerGUI:
             if not paths:
                 paths = root.findall('.//path')
 
-            for idx, path_el in enumerate(paths):
-                d = path_el.get('d', '')
-                if not d:
-                    continue
+            # Build parent map (ElementTree has no getparent())
+            parent_map = {child: parent for parent in root.iter() for child in parent}
 
-                self._log_safe(f"\nPath #{idx + 1}:")
-                cmds = parse_commands(d)
+            # Group paths by visual attributes, merge commands within each group
+            groups = _group_paths(paths)
+            total_output_paths = 0
+
+            for gi, (attrs, cmds, elements) in enumerate(groups):
                 total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Sub-path breaks (M after first): {total_m}")
+                self._log_safe(f"\nGroup #{gi + 1} ({len(elements)} paths merged, "
+                               f"{len(cmds)} commands, {total_m + 1} subpaths):")
 
                 # Step 1
                 cmds, micro_joined = join_by_threshold(cmds, threshold)
                 self._log_safe(f"  Micro-gaps joined (dist <= {threshold:.6g}): {micro_joined}")
                 remaining = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Remaining separate subpaths: {remaining}")
+                self._log_safe(f"  Remaining separate subpaths: {remaining + 1}")
 
                 # Step 2
                 cmds, traced = trace_graph(cmds, tol=graph_tol)
                 remaining2 = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
-                self._log_safe(f"  Graph-traced: {traced} merged ({remaining} -> {remaining2})")
+                self._log_safe(f"  Graph-traced: {traced} merged "
+                               f"({remaining + 1} -> {remaining2 + 1} subpaths)")
 
                 # Step 3: deduplicate near-coincident endpoints
                 before3 = len(cmds)
@@ -881,8 +1208,25 @@ class SVGPathFixerGUI:
                 if closed_count:
                     self._log_safe(f"  Subpaths closed (start~=end): {closed_count}")
 
-                path_el.set('d', cmds_to_str(cmds))
+                # Split result into continuous sections → one <path> per subpath
+                result_subpaths = split_into_subpaths(cmds)
+                self._log_safe(f"  Output: {len(result_subpaths)} continuous path(s)")
+                total_output_paths += len(result_subpaths)
 
+                # Remove all original path elements in this group
+                insert_parent = parent_map[elements[0]]
+                for el in elements:
+                    parent_map[el].remove(el)
+
+                # Insert new path elements (one per continuous section)
+                tag = elements[0].tag
+                for sp in result_subpaths:
+                    new_el = ET.SubElement(insert_parent, tag)
+                    new_el.set('d', cmds_to_str(sp))
+                    for k, v in attrs.items():
+                        new_el.set(k, v)
+
+            self._log_safe(f"\nTotal output: {total_output_paths} path element(s)")
             self.root.after(0, self._on_process_done, tree)
         except Exception as e:
             self.root.after(0, self._on_process_error, str(e))
@@ -945,4 +1289,5 @@ def main():
 
 
 if __name__ == '__main__':
+    multiprocessing.freeze_support()
     main()
