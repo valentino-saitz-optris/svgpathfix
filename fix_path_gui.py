@@ -506,6 +506,13 @@ class SVGPathFixerGUI:
         self._preview_request_id = 0
         self._preview_last_params = None
         self._preview_poll_id = None
+        self._preview_pts = None      # list of [(x,y)...] per subpath
+        self._preview_bounds = None   # (min_x, min_y, max_x, max_y)
+        self._view_zoom = 1.0
+        self._view_pan_x = 0.0
+        self._view_pan_y = 0.0
+        self._drag_start = None
+        self._drag_pan_start = None
         self._preview_in_q = multiprocessing.Queue()
         self._preview_out_q = multiprocessing.Queue()
         self._preview_process = multiprocessing.Process(
@@ -579,6 +586,12 @@ class SVGPathFixerGUI:
         self.preview_canvas = tk.Canvas(preview_frame, bg='white',
                                          highlightthickness=0)
         self.preview_canvas.pack(fill='both', expand=True)
+        self.preview_canvas.bind('<MouseWheel>', self._on_preview_scroll)
+        self.preview_canvas.bind('<Button-4>', self._on_preview_scroll)
+        self.preview_canvas.bind('<Button-5>', self._on_preview_scroll)
+        self.preview_canvas.bind('<ButtonPress-1>', self._on_preview_drag_start)
+        self.preview_canvas.bind('<B1-Motion>', self._on_preview_drag)
+        self.preview_canvas.bind('<Double-Button-1>', self._on_preview_reset)
         paned.add(preview_frame, weight=3)
 
         # Log (right)
@@ -855,31 +868,45 @@ class SVGPathFixerGUI:
         self._preview_poll_id = self.root.after(50, self._poll_preview)
 
     def _render_preview(self, subpaths):
-        """Draw processed subpaths on the preview canvas."""
+        """Store processed subpath data and redraw the preview canvas."""
+        # Flatten all subpaths to point lists
+        all_pts = [_flatten_subpath(sp) for sp in subpaths]
+        all_pts = [pts for pts in all_pts if len(pts) >= 2]
+        self._preview_pts = all_pts
+        self._preview_bounds = _compute_bounds(all_pts) if all_pts else None
+        # Reset view on new data
+        self._view_zoom = 1.0
+        self._view_pan_x = 0.0
+        self._view_pan_y = 0.0
+        self._redraw_preview()
+
+    def _redraw_preview(self):
+        """Draw stored point data with current zoom/pan transform."""
         c = self.preview_canvas
         c.delete('all')
 
-        # Flatten all subpaths to point lists
-        all_pts = [_flatten_subpath(sp) for sp in subpaths]
-        # Filter out empty
-        all_pts = [pts for pts in all_pts if len(pts) >= 2]
-        if not all_pts:
+        if not self._preview_pts or not self._preview_bounds:
             c.create_text(c.winfo_width() // 2, c.winfo_height() // 2,
                           text="No paths to display", fill='gray', font=('', 10))
             return
 
-        bounds = _compute_bounds(all_pts)
-        bx, by, bx2, by2 = bounds
+        bx, by, bx2, by2 = self._preview_bounds
         bw, bh = bx2 - bx, by2 - by
 
         cw = max(c.winfo_width(), 100)
         ch = max(c.winfo_height(), 100)
         margin = 12
-        scale = min((cw - 2 * margin) / bw, (ch - 2 * margin) / bh)
-        ox = margin + ((cw - 2 * margin) - bw * scale) / 2 - bx * scale
-        oy = margin + ((ch - 2 * margin) - bh * scale) / 2 - by * scale
+        base_scale = min((cw - 2 * margin) / bw, (ch - 2 * margin) / bh)
+        base_ox = margin + ((cw - 2 * margin) - bw * base_scale) / 2 - bx * base_scale
+        base_oy = margin + ((ch - 2 * margin) - bh * base_scale) / 2 - by * base_scale
 
-        for i, pts in enumerate(all_pts):
+        # Apply zoom (centered on canvas center) + pan
+        cx, cy = cw / 2, ch / 2
+        scale = base_scale * self._view_zoom
+        ox = cx + (base_ox - cx) * self._view_zoom + self._view_pan_x
+        oy = cy + (base_oy - cy) * self._view_zoom + self._view_pan_y
+
+        for i, pts in enumerate(self._preview_pts):
             color = PREVIEW_COLORS[i % len(PREVIEW_COLORS)]
             coords = []
             for x, y in pts:
@@ -889,8 +916,50 @@ class SVGPathFixerGUI:
                 c.create_line(*coords, fill=color, width=1)
 
         # Summary text
+        zoom_pct = self._view_zoom * 100
         c.create_text(4, ch - 4, anchor='sw', fill='gray', font=('Consolas', 8),
-                       text=f"{len(all_pts)} paths, {sum(len(p) for p in all_pts)} points")
+                       text=f"{len(self._preview_pts)} paths  |  {zoom_pct:.0f}%")
+
+    def _on_preview_scroll(self, event):
+        """Zoom preview at cursor position on mouse wheel."""
+        if not self._preview_pts:
+            return
+        # Determine scroll direction
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            factor = 1.25
+        else:
+            factor = 1 / 1.25
+        mx, my = event.x, event.y
+        cw = max(self.preview_canvas.winfo_width(), 100)
+        ch = max(self.preview_canvas.winfo_height(), 100)
+        cx, cy = cw / 2, ch / 2
+        # Adjust pan so the world point under cursor stays fixed
+        self._view_pan_x -= (mx - cx - self._view_pan_x) * (factor - 1)
+        self._view_pan_y -= (my - cy - self._view_pan_y) * (factor - 1)
+        self._view_zoom *= factor
+        self._redraw_preview()
+
+    def _on_preview_drag_start(self, event):
+        """Start dragging to pan the preview."""
+        self._drag_start = (event.x, event.y)
+        self._drag_pan_start = (self._view_pan_x, self._view_pan_y)
+
+    def _on_preview_drag(self, event):
+        """Pan the preview while dragging."""
+        if self._drag_start is None:
+            return
+        dx = event.x - self._drag_start[0]
+        dy = event.y - self._drag_start[1]
+        self._view_pan_x = self._drag_pan_start[0] + dx
+        self._view_pan_y = self._drag_pan_start[1] + dy
+        self._redraw_preview()
+
+    def _on_preview_reset(self, event):
+        """Reset preview zoom/pan to fit-all on double-click."""
+        self._view_zoom = 1.0
+        self._view_pan_x = 0.0
+        self._view_pan_y = 0.0
+        self._redraw_preview()
 
     def _on_close(self):
         """Clean shutdown: stop preview subprocess, destroy window."""
