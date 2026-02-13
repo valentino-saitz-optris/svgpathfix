@@ -16,6 +16,15 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import xml.etree.ElementTree as ET
 
+# Set Windows AppID to fix taskbar icon showing as Python logo
+if sys.platform == "win32":
+    try:
+        import ctypes
+        myappid = 'valentino-saitz.svgpathfix.v1' # arbitrary string
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception:
+        pass
+
 # Ensure svgpathfix_cli.py can be imported from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -493,6 +502,16 @@ def auto_analyze_svg(svg_path):
 class SVGPathFixerGUI:
     def __init__(self, root):
         self.root = root
+        
+        # Set window icon
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+            if os.path.exists(icon_path):
+                self.icon_img = tk.PhotoImage(file=icon_path)
+                self.root.iconphoto(True, self.icon_img)
+        except Exception as e:
+            print(f"Warning: Could not load icon: {e}")
+
         self.root.title("SVG Path Fixer")
         if MPL_AVAILABLE:
             self.root.geometry("1200x850")
@@ -1430,6 +1449,11 @@ def main():
         root = TkinterDnD.Tk()
     else:
         root = tk.Tk()
+
+    # Set window icon
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'svgpathfix.ico')
+    if os.path.isfile(icon_path):
+        root.iconbitmap(icon_path)
 
     app = SVGPathFixerGUI(root)
 
