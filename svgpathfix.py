@@ -2,12 +2,12 @@
 Tkinter GUI for SVG Path Fixer.
 
 Loads an SVG, auto-analyzes gap, segment, and endpoint distributions to
-recommend parameters, then processes the path using fix_path's 5-step pipeline.
+recommend parameters, then processes the path using svgpathfix_cli's 5-step pipeline.
 Displays interactive histograms with log-scale sliders for picking values.
 """
 
+import copy
 import math
-import multiprocessing
 import os
 import queue
 import sys
@@ -16,14 +16,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import xml.etree.ElementTree as ET
 
-# Ensure fix_path.py can be imported from same directory
+# Ensure svgpathfix_cli.py can be imported from same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from svgpathfix_cli import (
     parse_commands, get_endpoint, dist, cmds_to_str,
     join_by_threshold, trace_graph, deduplicate_endpoints,
     simplify_short_runs, close_subpaths, split_into_subpaths,
-    subpath_endpoints,
+    subpath_endpoints, LINE_CMDS,
 )
 
 # Optional drag & drop support
@@ -43,8 +43,6 @@ try:
     MPL_AVAILABLE = True
 except ImportError:
     MPL_AVAILABLE = False
-
-LINE_CMDS = {'L', 'l', 'H', 'h', 'V', 'v'}
 
 SLIDER_STEPS = 1000
 COLOR_BELOW = '#4A90D9'
@@ -90,55 +88,75 @@ def _flatten_subpath(cmds):
     pts = []
     cx, cy = 0.0, 0.0
     sx, sy = 0.0, 0.0  # subpath start
+    # Second control point of previous cubic (for S/s reflection)
+    prev_c2x, prev_c2y = 0.0, 0.0
 
     for cmd, args in cmds:
         if cmd == 'M':
             cx, cy = args[0], args[1]
             sx, sy = cx, cy
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'm':
             cx, cy = cx + args[0], cy + args[1]
             sx, sy = cx, cy
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'L':
             cx, cy = args[0], args[1]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'l':
             cx, cy = cx + args[0], cy + args[1]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'H':
             cx = args[0]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'h':
             cx = cx + args[0]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'V':
             cy = args[0]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'v':
             cy = cy + args[0]
+            prev_c2x, prev_c2y = cx, cy
             pts.append((cx, cy))
         elif cmd == 'C':
             bezier = _cubic_bezier_points(
                 cx, cy, args[0], args[1], args[2], args[3], args[4], args[5])
             pts.extend(bezier[1:])  # skip first (=current pos)
+            prev_c2x, prev_c2y = args[2], args[3]
             cx, cy = args[4], args[5]
         elif cmd == 'c':
+            abs_c2x, abs_c2y = cx + args[2], cy + args[3]
             bezier = _cubic_bezier_points(
                 cx, cy, cx+args[0], cy+args[1],
-                cx+args[2], cy+args[3], cx+args[4], cy+args[5])
+                abs_c2x, abs_c2y, cx+args[4], cy+args[5])
             pts.extend(bezier[1:])
+            prev_c2x, prev_c2y = abs_c2x, abs_c2y
             cx, cy = cx + args[4], cy + args[5]
         elif cmd == 'S':
-            # Smooth cubic — use endpoint as control point (simplified)
+            # Smooth cubic — reflect previous C's second control point
+            c1x = 2 * cx - prev_c2x
+            c1y = 2 * cy - prev_c2y
             bezier = _cubic_bezier_points(
-                cx, cy, cx, cy, args[0], args[1], args[2], args[3])
+                cx, cy, c1x, c1y, args[0], args[1], args[2], args[3])
             pts.extend(bezier[1:])
+            prev_c2x, prev_c2y = args[0], args[1]
             cx, cy = args[2], args[3]
         elif cmd == 's':
+            c1x = 2 * cx - prev_c2x
+            c1y = 2 * cy - prev_c2y
+            abs_c2x, abs_c2y = cx + args[0], cy + args[1]
             bezier = _cubic_bezier_points(
-                cx, cy, cx, cy, cx+args[0], cy+args[1], cx+args[2], cy+args[3])
+                cx, cy, c1x, c1y, abs_c2x, abs_c2y, cx+args[2], cy+args[3])
             pts.extend(bezier[1:])
+            prev_c2x, prev_c2y = abs_c2x, abs_c2y
             cx, cy = cx + args[2], cy + args[3]
         elif cmd == 'Q':
             # Quadratic → approximate as cubic
@@ -149,6 +167,7 @@ def _flatten_subpath(cmds):
             cy2 = qy2 + 2/3 * (qy1 - qy2)
             bezier = _cubic_bezier_points(cx, cy, cx1, cy1, cx2, cy2, qx2, qy2)
             pts.extend(bezier[1:])
+            prev_c2x, prev_c2y = cx, cy
             cx, cy = qx2, qy2
         elif cmd == 'q':
             qx1, qy1, qx2, qy2 = cx+args[0], cy+args[1], cx+args[2], cy+args[3]
@@ -158,15 +177,18 @@ def _flatten_subpath(cmds):
             cy2 = qy2 + 2/3 * (qy1 - qy2)
             bezier = _cubic_bezier_points(cx, cy, cx1, cy1, cx2, cy2, qx2, qy2)
             pts.extend(bezier[1:])
+            prev_c2x, prev_c2y = cx, cy
             cx, cy = qx2, qy2
         elif cmd in ('Z', 'z'):
             if (cx, cy) != (sx, sy):
                 pts.append((sx, sy))
             cx, cy = sx, sy
+            prev_c2x, prev_c2y = cx, cy
         else:
             # T, t, A, a — approximate with line to endpoint
             ex, ey = get_endpoint(cmd, args, cx, cy)
             pts.append((ex, ey))
+            prev_c2x, prev_c2y = ex, ey
             cx, cy = ex, ey
 
     return pts
@@ -225,14 +247,15 @@ def _preview_worker(in_q, out_q):
                 if newer is None:
                     return
                 msg = newer
-            except Exception:
+            except queue.Empty:
                 break
         group_cmds_list, threshold, simplify, graph_tol = msg
         try:
             result = _process_cmds(group_cmds_list, threshold, simplify, graph_tol)
             out_q.put(result)
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()
 
 
 # ── Auto-analysis functions ───────────────────────────────────────────
@@ -908,7 +931,7 @@ class SVGPathFixerGUI:
         try:
             while True:
                 self._preview_in_q.get_nowait()
-        except Exception:
+        except queue.Empty:
             pass
         self._preview_in_q.put((
             self._raw_group_cmds,
@@ -1332,7 +1355,7 @@ class SVGPathFixerGUI:
     def _run_save(self, save_path, threshold, simplify, graph_tol):
         try:
             ET.register_namespace('', 'http://www.w3.org/2000/svg')
-            tree = ET.parse(self.current_file)
+            tree = copy.deepcopy(self.analysis['tree'])
             root = tree.getroot()
             paths = root.findall('.//{http://www.w3.org/2000/svg}path')
             if not paths:
@@ -1417,5 +1440,4 @@ def main():
 
 
 if __name__ == '__main__':
-    multiprocessing.freeze_support()
     main()

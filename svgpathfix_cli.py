@@ -4,7 +4,7 @@ joins them by replacing close M (moveTo) commands with L (lineTo),
 and simplifies jittery micro-segments.
 
 Usage:
-  python fix_path.py [input.svg] [output.svg] [threshold] [--simplify N]
+  python svgpathfix_cli.py [input.svg] [output.svg] [threshold] [--simplify N] [--tolerance N]
 
   threshold     max gap to auto-join (default 0.5)
   --simplify N  collapse runs of line segments shorter than N into single
@@ -14,6 +14,7 @@ Usage:
 import re
 import xml.etree.ElementTree as ET
 import math
+import os
 import sys
 
 CMD_ARGS = {
@@ -84,7 +85,7 @@ def cmds_to_str(cmds):
     parts = []
     for cmd, args in cmds:
         if args:
-            parts.append(cmd + ' '.join(fmt(a) for a in args))
+            parts.append(cmd + ' ' + ' '.join(fmt(a) for a in args))
         else:
             parts.append(cmd)
     return ''.join(parts)
@@ -161,30 +162,60 @@ def subpath_endpoints(sp):
 def reverse_subpath(sp):
     """
     Reverse a subpath so it goes from its old end to its old start.
-    Only handles L/H/V/C commands (the ones present in this SVG).
+    Handles L/H/V/C/S/Q/A commands in absolute form.
     Returns a new command list starting with M at the old endpoint.
     """
     # First, compute all the waypoints (absolute positions after each command)
     points = []
     cx, cy = 0.0, 0.0
-    curve_data = []  # store (cmd, control points) for curves
+    prev_c2x, prev_c2y = 0.0, 0.0  # second control point of previous C (for S)
 
     for i, (cmd, args) in enumerate(sp):
         if cmd == 'M':
             cx, cy = args[0], args[1]
+            prev_c2x, prev_c2y = cx, cy
             points.append(('M', cx, cy, None))
         elif cmd in ('L', 'H', 'V'):
             ex, ey = get_endpoint(cmd, args, cx, cy)
+            prev_c2x, prev_c2y = ex, ey
             points.append(('L', ex, ey, None))
             cx, cy = ex, ey
         elif cmd == 'C':
             # C x1 y1 x2 y2 x y — cubic bezier
             points.append(('C', args[4], args[5],
                           (cx, cy, args[0], args[1], args[2], args[3], args[4], args[5])))
+            prev_c2x, prev_c2y = args[2], args[3]
             cx, cy = args[4], args[5]
+        elif cmd == 'S':
+            # S x2 y2 x y — smooth cubic, first control point is reflection of prev C's c2
+            c1x = 2 * cx - prev_c2x
+            c1y = 2 * cy - prev_c2y
+            c2x, c2y = args[0], args[1]
+            ex, ey = args[2], args[3]
+            # Store as full cubic data for correct reversal
+            points.append(('C', ex, ey,
+                          (cx, cy, c1x, c1y, c2x, c2y, ex, ey)))
+            prev_c2x, prev_c2y = c2x, c2y
+            cx, cy = ex, ey
+        elif cmd == 'Q':
+            # Q x1 y1 x y — quadratic bezier
+            qx, qy = args[0], args[1]
+            ex, ey = args[2], args[3]
+            points.append(('Q', ex, ey,
+                          (cx, cy, qx, qy, ex, ey)))
+            prev_c2x, prev_c2y = ex, ey
+            cx, cy = ex, ey
+        elif cmd == 'A':
+            # A rx ry x-rot large-arc sweep x y
+            ex, ey = args[5], args[6]
+            points.append(('A', ex, ey,
+                          (args[0], args[1], args[2], args[3], args[4], ex, ey)))
+            prev_c2x, prev_c2y = ex, ey
+            cx, cy = ex, ey
         else:
-            # For other commands, treat as line to endpoint
+            # Relative or other commands: convert to absolute line
             ex, ey = get_endpoint(cmd, args, cx, cy)
+            prev_c2x, prev_c2y = ex, ey
             points.append(('L', ex, ey, None))
             cx, cy = ex, ey
 
@@ -204,6 +235,14 @@ def reverse_subpath(sp):
             # Reversed: from (ex,ey) via (c2x,c2y) (c1x,c1y) to (sx,sy)
             sx, sy, c1x, c1y, c2x, c2y, ex, ey = points[j][3]
             rev.append(('C', [c2x, c2y, c1x, c1y, prev_x, prev_y]))
+        elif typ == 'Q' and points[j][3] is not None:
+            # Reverse quadratic: same control point, swap start/end
+            sx, sy, qx, qy, ex, ey = points[j][3]
+            rev.append(('Q', [qx, qy, prev_x, prev_y]))
+        elif typ == 'A' and points[j][3] is not None:
+            # Reverse arc: same radii and rotation, flip sweep flag
+            rx, ry, x_rot, large_arc, sweep, ex, ey = points[j][3]
+            rev.append(('A', [rx, ry, x_rot, large_arc, 1 - sweep, prev_x, prev_y]))
         else:
             rev.append(('L', [prev_x, prev_y]))
 
@@ -478,7 +517,7 @@ def close_subpaths(cmds, tol=0.01):
 
 # ── Pipeline ────────────────────────────────────────────────────────────
 
-def process_path(d, threshold=0.5, simplify=None):
+def process_path(d, threshold=0.5, simplify=None, tol=0.1):
     cmds = parse_commands(d)
     total_m = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
     print(f"  Total sub-path breaks (M commands after first): {total_m}")
@@ -491,7 +530,7 @@ def process_path(d, threshold=0.5, simplify=None):
     print(f"  Remaining separate subpaths: {remaining}")
 
     # Step 2: trace graph — merge subpaths sharing endpoints (reversing as needed)
-    cmds, traced = trace_graph(cmds)
+    cmds, traced = trace_graph(cmds, tol=tol)
     remaining2 = sum(1 for c, _ in cmds[1:] if c in ('M', 'm'))
     print(f"  Graph-traced (reversing where needed): {traced} merged ({remaining} -> {remaining2})")
 
@@ -517,34 +556,51 @@ def process_path(d, threshold=0.5, simplify=None):
     return cmds_to_str(cmds)
 
 
-def main():
-    args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    flags = [a for a in sys.argv[1:] if a.startswith('--')]
-
-    src = args[0] if len(args) > 0 else 'Vector.svg'
-    dst = args[1] if len(args) > 1 else 'Vector_joined.svg'
-    threshold = float(args[2]) if len(args) > 2 else 0.5
-
-    # Parse --simplify N
-    simplify = None
+def _parse_flag(flags, name, default=None):
+    """Parse a --name N or --name=N flag from the flag list."""
     for f in flags:
-        if f.startswith('--simplify'):
+        if f.startswith(f'--{name}'):
             if '=' in f:
-                simplify = float(f.split('=')[1])
+                return float(f.split('=')[1])
             else:
                 idx = sys.argv.index(f)
                 if idx + 1 < len(sys.argv):
                     try:
-                        simplify = float(sys.argv[idx + 1])
+                        return float(sys.argv[idx + 1])
                     except ValueError:
-                        simplify = 1.0
+                        return default
                 else:
-                    simplify = 1.0
+                    return default
+    return None
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    flags = [a for a in sys.argv[1:] if a.startswith('--')]
+
+    if len(args) < 1:
+        print("Usage: python svgpathfix_cli.py <input.svg> [output.svg] [threshold]"
+              " [--simplify N] [--tolerance N]")
+        sys.exit(1)
+
+    src = args[0]
+    dst = args[1] if len(args) > 1 else os.path.splitext(src)[0] + '_fixed.svg'
+    threshold = float(args[2]) if len(args) > 2 else 0.5
+
+    simplify = _parse_flag(flags, 'simplify', default=1.0)
+    tolerance = _parse_flag(flags, 'tolerance', default=0.1)
+    if tolerance is None:
+        tolerance = 0.1
+
+    if not os.path.isfile(src):
+        print(f"Error: file not found: {src}")
+        sys.exit(1)
 
     print(f"Input    : {src}")
     print(f"Output   : {dst}")
     print(f"Threshold: {threshold}")
-    print(f"Simplify : {simplify}\n")
+    print(f"Simplify : {simplify}")
+    print(f"Tolerance: {tolerance}\n")
 
     ET.register_namespace('', 'http://www.w3.org/2000/svg')
     tree = ET.parse(src)
@@ -561,7 +617,7 @@ def main():
         if not d:
             continue
         print(f"Path #{idx + 1}:")
-        new_d = process_path(d, threshold, simplify)
+        new_d = process_path(d, threshold, simplify, tol=tolerance)
         path_el.set('d', new_d)
         print()
 

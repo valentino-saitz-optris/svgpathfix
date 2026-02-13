@@ -77,20 +77,21 @@ At high zoom levels, individual path vertices become visible along with start (g
 ### CLI
 
 ```bash
-python svgpathfix_cli.py [input.svg] [output.svg] [threshold] [--simplify N]
+python svgpathfix_cli.py <input.svg> [output.svg] [threshold] [--simplify N] [--tolerance N]
 ```
 
 | Argument | Default | Description |
 |---|---|---|
-| `input.svg` | `Vector.svg` | Input SVG file |
-| `output.svg` | `Vector_joined.svg` | Output SVG file |
-| `threshold` | `0.5` | Max gap distance to auto-join |
-| `--simplify N` | off | Collapse line segments shorter than N |
+| `input.svg` | *(required)* | Input SVG file |
+| `output.svg` | `<input>_fixed.svg` | Output SVG file |
+| `threshold` | `0.5` | Max gap distance to auto-join (step 1) |
+| `--simplify N` | off | Collapse line segments shorter than N (step 4) |
+| `--tolerance N` | `0.1` | Max endpoint distance to merge in graph trace (step 2) |
 
 **Examples:**
 
 ```bash
-# Basic usage with defaults
+# Basic usage — output goes to drawing_fixed.svg
 python svgpathfix_cli.py drawing.svg
 
 # Custom output and threshold
@@ -98,6 +99,9 @@ python svgpathfix_cli.py drawing.svg fixed.svg 0.3
 
 # With segment simplification
 python svgpathfix_cli.py drawing.svg fixed.svg 0.5 --simplify 0.2
+
+# With custom graph-trace tolerance
+python svgpathfix_cli.py drawing.svg fixed.svg 0.5 --tolerance 0.5
 ```
 
 ## How It Works
