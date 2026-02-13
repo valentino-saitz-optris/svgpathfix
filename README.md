@@ -33,7 +33,7 @@ git clone https://github.com/valentino-saitz-optris/svgpathfix.git
 cd svgpathfix
 
 # Install optional dependencies (recommended)
-pip install matplotlib numpy tkinterdnd2
+pip install -r requirements.txt
 ```
 
 | Dependency | Required | Purpose |
